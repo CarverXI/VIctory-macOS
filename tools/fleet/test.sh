@@ -107,6 +107,17 @@ no "seconds with too many decimals" bad '.binaries[0].seconds = 1.234'
 ok "seconds as cargo prints them" bad '.binaries = [{suite: "native", name: "census", seconds: 0.28},
     {suite: "native", name: "victory_formats", seconds: 4.89}, {suite: "wine", name: "victory", seconds: 0.07}]'
 ok "every time to two decimals" bad '.binaries = [range(80) | {suite: "native", name: "b\(.)", seconds: ("0.\(. + 10)" | tonumber)}]'
+# Includes task #98's rejected values and valid hundredths near the bounds.
+for seconds in 0.55 0.07 0.28 0 0.01 0.29 1.13 1.14 9.49 14.23 25.15 99999.99 100000; do
+    ok "binary seconds $seconds" bad ".binaries[0].seconds = $seconds"
+    ok "suite seconds $seconds" bad ".timings.native = $seconds"
+done
+for seconds in -0.01 100000.01 0.551 0.5500000000000001 99999.999; do
+    no "invalid binary seconds $seconds" bad ".binaries[0].seconds = $seconds"
+    no "invalid suite seconds $seconds" bad ".timings.native = $seconds"
+done
+no "numeric text is not binary seconds" bad '.binaries[0].seconds = "0.55"'
+no "numeric text is not suite seconds" bad '.timings.native = "0.55"'
 no "binary name with text" bad '.binaries[0].name = "see https://x"'
 no "unknown suite" bad '.binaries[0].suite = "game"'
 ok "null timings" bad '.timings = {setup: 5, native: null, wine: null}'
