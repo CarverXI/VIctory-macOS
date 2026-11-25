@@ -990,6 +990,16 @@ fn widened_format(format: i32) -> Option<DXGI_FORMAT> {
     }
 }
 
+/// The fourth component's bits for a widened three-channel SRV. Integer
+/// formats must not receive the bit pattern of floating-point 1.0.
+fn widened_w(format: i32) -> Option<u32> {
+    match format {
+        6 => Some(1.0f32.to_bits()),
+        7 | 8 => Some(1),
+        _ => None,
+    }
+}
+
 /// Whether a DXGI format is an integer one, and if so whether signed:
 /// `Some(false)` for `UINT`, `Some(true)` for `SINT`, `None` otherwise.
 fn integer_format(format: u32) -> Option<bool> {
@@ -1213,7 +1223,8 @@ fn buffer_srv(
     let host = host()?;
     if crate::shader_cache::under_wine()
         && matches!(desc.Format.0, 6..=8)
-        && let Some(widened) = shadow.widened(start, u64::from(count) * 12)
+        && let Some(w) = widened_w(desc.Format.0)
+        && let Some(widened) = shadow.widened(start, u64::from(count) * 12, w)
     {
         desc.Format = widened_format(desc.Format.0).expect("a three-channel format");
         buffer.FirstElement = 0;
@@ -1805,11 +1816,15 @@ mod tests {
         assert_eq!(widened_format(7), Some(DXGI_FORMAT_R32G32B32A32_UINT));
         assert_eq!(widened_format(8), Some(DXGI_FORMAT_R32G32B32A32_SINT));
         assert_eq!(widened_format(2), None);
+        assert_eq!(widened_w(6), Some(0x3f80_0000));
+        assert_eq!(widened_w(7), Some(1));
+        assert_eq!(widened_w(8), Some(1));
+        assert_eq!(widened_w(2), None);
     }
 
     /// Three-channel 32-bit SRVs are backed by a widened copy on hosts that
     /// read R32G32B32 as R32G32. The copy keeps 12-byte source elements,
-    /// supplies w = 1 and follows later title writes.
+    /// supplies w in the source format and follows later title writes.
     #[test]
     fn three_channel_srvs_use_a_widened_refreshed_copy() {
         if !crate::shader_cache::under_wine() {
@@ -1831,7 +1846,7 @@ mod tests {
         let heap: ID3D12DescriptorHeap = unsafe {
             host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: 2,
+                NumDescriptors: 4,
                 ..Default::default()
             })
         }
@@ -1858,22 +1873,24 @@ mod tests {
         // SAFETY: a live resource.
         let made = unsafe { resource.GetDesc() };
         assert_eq!(made.Width, 4 * 16);
-        let one = 0x3f80_0000;
-        assert_eq!(
-            widened.read_host(16),
-            [1000, 2000, 3000, one, 1003, 2003, 3003, one, 1006, 2006, 3006, one, 1009, 2009, 3009, one]
-        );
+        let float_one = 0x3f80_0000;
+        let want = |w| {
+            [
+                1000, 2000, 3000, w, 1003, 2003, 3003, w, 1006, 2006, 3006, w, 1009, 2009, 3009, w,
+            ]
+        };
+        assert_eq!(widened.read_host(16), want(float_one));
 
-        // SAFETY: a live heap; its second slot is one descriptor stride on.
+        // SAFETY: a live heap; each later slot is one descriptor stride on.
         let step = unsafe {
             host.device
                 .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
         };
-        let second_at = D3D12_CPU_DESCRIPTOR_HANDLE {
-            ptr: at.ptr + step as usize,
+        let at_slot = |slot: usize| D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: at.ptr + slot * step as usize,
         };
         let (second_resource, second_source) =
-            buffer_srv(p as u64, len as u64, desc, second_at)
+            buffer_srv(p as u64, len as u64, desc, at_slot(1))
                 .expect("a second view")
                 .expect("a second kept view");
         let Some(HeldSource::Widened(second, _)) = second_source else {
@@ -1881,20 +1898,65 @@ mod tests {
         };
         assert!(
             std::sync::Arc::ptr_eq(&widened, &second),
-            "one widened copy per range"
+            "one widened copy per range and w"
         );
         drop((second_resource, second));
+
+        let uint_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32G32B32_UINT,
+            ..desc
+        };
+        let (uint_resource, uint_source) = buffer_srv(p as u64, len as u64, uint_desc, at_slot(2))
+            .expect("a uint view")
+            .expect("a kept uint view");
+        let Some(HeldSource::Widened(uint, _)) = uint_source else {
+            panic!("a widened uint source");
+        };
+        let sint_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32G32B32_SINT,
+            ..desc
+        };
+        let (sint_resource, sint_source) = buffer_srv(p as u64, len as u64, sint_desc, at_slot(3))
+            .expect("a sint view")
+            .expect("a kept sint view");
+        let Some(HeldSource::Widened(sint, _)) = sint_source else {
+            panic!("a widened sint source");
+        };
+        assert!(
+            std::sync::Arc::ptr_eq(&uint, &sint),
+            "integer formats share their widened copy"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(&widened, &uint),
+            "float and integer w bits need distinct copies"
+        );
+        assert_eq!(uint.read_host(16), want(1));
+        assert_eq!(sint.read_host(16), want(1));
 
         let changed = [0x1111_1111, 0x2222_2222, 0x3333_3333];
         // SAFETY: one 12-byte element of our pool page.
         unsafe { std::ptr::copy_nonoverlapping(changed.as_ptr().cast::<u8>(), (p + 12) as *mut u8, 12) };
         assert!(shadow.update(p, len) > 0, "the title write is copied");
-        assert_eq!(
-            widened.read_host(16),
-            [1000, 2000, 3000, one, 0x1111_1111, 0x2222_2222, 0x3333_3333, one, 1006, 2006, 3006, one, 1009, 2009, 3009, one]
-        );
+        let changed_want = |w| {
+            [
+                1000, 2000, 3000, w, 0x1111_1111, 0x2222_2222, 0x3333_3333, w, 1006, 2006, 3006, w,
+                1009, 2009, 3009, w,
+            ]
+        };
+        assert_eq!(widened.read_host(16), changed_want(float_one));
+        assert_eq!(uint.read_host(16), changed_want(1));
+        assert_eq!(sint.read_host(16), changed_want(1));
 
-        drop((resource, widened, heap, shadow));
+        drop((
+            resource,
+            widened,
+            uint_resource,
+            uint,
+            sint_resource,
+            sint,
+            heap,
+            shadow,
+        ));
         crate::shadow::unregister(p, p as u64);
         crate::watch::tests::free(p);
     }

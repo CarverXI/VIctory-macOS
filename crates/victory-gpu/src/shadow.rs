@@ -48,8 +48,9 @@ pub(crate) struct Shadow {
     /// views of it are marked there ([`Shadow::mark_entry`]).
     marks: Option<u32>,
     /// Widened three-channel views reading this copy, refreshed when their
-    /// source bytes change.
-    widened: Mutex<Vec<(u64, u64, std::sync::Weak<Widened>)>>,
+    /// source bytes change. The fourth component is part of the key: float
+    /// views need the bits of 1.0, integer views need the integer 1.
+    widened: Mutex<WidenedViews>,
     has_widened: AtomicBool,
     /// Where it starts in `buffer` (0 but for copies sharing a buffer), and
     /// the run of the shared buffer it holds ([`Arena`]), given back when it
@@ -60,12 +61,13 @@ pub(crate) struct Shadow {
 
 /// A 16-byte-element host copy of a three-channel 32-bit buffer view. D3DMetal
 /// reads R32G32B32 typed SRVs as R32G32; an R32G32B32A32 view over this copy
-/// keeps the title's 12-byte stride and supplies w = 1.
+/// keeps the title's 12-byte stride and supplies `w` in the source format.
 pub(crate) struct Widened {
     pub(crate) buffer: ID3D12Resource,
     data: *mut u8,
     start: u64,
     len: u64,
+    w: u32,
 }
 
 // SAFETY: the resource is free-threaded; `data` is a persistent mapping
@@ -73,6 +75,9 @@ pub(crate) struct Widened {
 unsafe impl Send for Widened {}
 // SAFETY: as above.
 unsafe impl Sync for Widened {}
+
+/// Widened views by source range and fourth-component bits.
+type WidenedViews = Vec<(u64, u64, u32, std::sync::Weak<Widened>)>;
 
 impl Widened {
     fn refresh(&self, shadow: &Shadow, from: usize, to: usize) {
@@ -92,7 +97,7 @@ impl Widened {
                 let at = source.add(i * 12);
                 let to = self.data.add(i * 16);
                 std::ptr::copy_nonoverlapping(at, to, 12);
-                to.add(12).cast::<u32>().write_volatile(0x3f80_0000);
+                to.add(12).cast::<u32>().write_volatile(self.w);
             }
         }
     }
@@ -208,8 +213,13 @@ impl Shadow {
 
     /// A widened copy of `len` bytes at `address` for a three-channel
     /// 32-bit typed SRV. The source stays in its normal 12-byte layout;
-    /// this copy has 16-byte elements with w = 1.
-    pub(crate) fn widened(self: &Arc<Self>, address: u64, len: u64) -> Option<Arc<Widened>> {
+    /// this copy has 16-byte elements with the requested `w` bits.
+    pub(crate) fn widened(
+        self: &Arc<Self>,
+        address: u64,
+        len: u64,
+        w: u32,
+    ) -> Option<Arc<Widened>> {
         if len == 0 || !len.is_multiple_of(12) {
             return None;
         }
@@ -218,8 +228,10 @@ impl Shadow {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .iter()
-                .find(|&&(start, size, _)| start == address && size == len)
-                .and_then(|(_, _, view)| view.upgrade())
+                .find(|&&(start, size, fourth, _)| {
+                    start == address && size == len && fourth == w
+                })
+                .and_then(|(_, _, _, view)| view.upgrade())
         };
         if let Some(view) = found() {
             return Some(view);
@@ -231,6 +243,7 @@ impl Shadow {
             data,
             start: address,
             len,
+            w,
         });
         widened.refresh(self, address as usize, (address + len) as usize);
         let mut views = self.widened.lock().unwrap_or_else(|e| e.into_inner());
@@ -238,15 +251,17 @@ impl Shadow {
         // being allocated.
         if let Some(view) = views
             .iter()
-            .find(|&&(start, size, _)| start == address && size == len)
-            .and_then(|(_, _, view)| view.upgrade())
+            .find(|&&(start, size, fourth, _)| {
+                start == address && size == len && fourth == w
+            })
+            .and_then(|(_, _, _, view)| view.upgrade())
         {
             return Some(view);
         }
         if views.len().is_power_of_two() {
-            views.retain(|(_, _, view)| view.strong_count() > 0);
+            views.retain(|(_, _, _, view)| view.strong_count() > 0);
         }
-        views.push((address, len, Arc::downgrade(&widened)));
+        views.push((address, len, w, Arc::downgrade(&widened)));
         drop(views);
         self.has_widened.store(true, Ordering::Release);
         Some(widened)
@@ -258,7 +273,7 @@ impl Shadow {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .filter_map(|(_, _, view)| view.upgrade())
+            .filter_map(|(_, _, _, view)| view.upgrade())
             .collect();
         for view in views {
             view.refresh(self, from, to);
