@@ -1017,7 +1017,8 @@ impl<'a> Lower<'a> {
             args.push(self.s.m.i32(4));
             self.s
                 .op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
-            self.mark_view_write(h, off, 4 * u32::from(n), None);
+            let bytes = self.s.m.i32(4 * u32::from(n));
+            self.mark_view_write(h, off, bytes, None);
             self.end_guarded(at, &[]);
             return Ok(());
         }
@@ -1060,7 +1061,8 @@ impl<'a> Lower<'a> {
             );
             first.get_or_insert(r);
         }
-        self.mark_view_write(h, off, 4, None);
+        let bytes = self.s.m.i32(4);
+        self.mark_view_write(h, off, bytes, None);
         let zero = self.s.m.i32(0);
         let r = self.end_guarded(at, &[(first.expect("an atomic"), zero)])[0];
         if let Some(reg) = returned {
@@ -4545,7 +4547,7 @@ impl<'a> Lower<'a> {
     /// notes, "Write marks"): the bits of its first and last byte, each set
     /// only where still clear. Nothing for handles that are no heap view, or
     /// without [`Parts::view_marks`].
-    fn mark_view_write(&mut self, h: V, x: V, bytes: u32, guard: Option<V>) {
+    fn mark_view_write(&mut self, h: V, x: V, bytes: V, guard: Option<V>) {
         if !self.x.view_marks {
             return;
         }
@@ -4567,7 +4569,10 @@ impl<'a> Lower<'a> {
             None => valid,
         };
         let first = self.s.m.bin(c, Bin::Add, phase, x);
-        let span = k(self, bytes.max(1) - 1);
+        let (zero, one) = (k(self, 0), k(self, 1));
+        let nonempty = self.s.m.cmp(c, pred::NE, bytes, zero);
+        let span = self.s.m.bin(c, Bin::Sub, bytes, one);
+        let span = self.s.m.select(c, nonempty, span, zero);
         let last = self.s.m.bin(c, Bin::Add, first, span);
         let (k16, cap) = (k(self, 16), k(self, super::VIEW_WRITE_BITS - 1));
         let mut bits = Vec::new();
@@ -9508,7 +9513,8 @@ impl<'a> Lower<'a> {
                 self.s
                     .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
             };
-            self.mark_view_write(h, byte, 4, None);
+            let bytes = self.s.m.i32(4);
+            self.mark_view_write(h, byte, bytes, None);
             let r = self.end_guarded(at, &[(r, old)])[0];
             if returns {
                 self.write(inst, Reg::V(reg), r, None);
@@ -9542,7 +9548,8 @@ impl<'a> Lower<'a> {
                 self.s
                     .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args);
             }
-            self.mark_view_write(h, at, 4, None);
+            let bytes = self.s.m.i32(4);
+            self.mark_view_write(h, at, bytes, None);
             self.end_guarded(begin, &[]);
             return Ok(());
         }
@@ -9594,8 +9601,11 @@ impl<'a> Lower<'a> {
             let (op, name) = if typed {
                 // shortcut: typed stores are taken to write all four channels
                 // of a float format.
-                if count != 4 || *offen || *offset != 0 {
+                if count != 4 {
                     return Err("a typed buffer store of some channels or at an offset");
+                }
+                if *offen || *offset != 0 || matches!(off, V::Inst(_)) {
+                    return Err("a typed buffer store at an offset");
                 }
                 let h = typed_h.ok_or("a typed buffer store")?;
                 let element = index.unwrap_or(self.s.m.i32(0));
@@ -9604,13 +9614,19 @@ impl<'a> Lower<'a> {
                 for x in vals {
                     args.push(self.as_float(x));
                 }
-                // The element's size is the view's stride (16 bytes at most).
-                (byte, bytes) = match self.s.view_index.get(&h).copied() {
-                    Some(at) if self.x.view_marks => {
-                        let stride = self.stride_at(at);
-                        (self.s.m.bin(self.cur, Bin::Mul, element, stride), 16)
-                    }
-                    _ => (element, 16),
+                // The element's size is the view's stride, not always 16. It
+                // is needed at run time only for the write marks.
+                (byte, bytes) = if self.x.view_marks {
+                    let at = self
+                        .s
+                        .view_index
+                        .get(&h)
+                        .copied()
+                        .ok_or("a typed buffer store")?;
+                    let stride = self.stride_at(at);
+                    (self.s.m.bin(self.cur, Bin::Mul, element, stride), stride)
+                } else {
+                    (element, self.s.m.i32(0))
                 };
                 (69, "bufferStore.f32")
             } else {
@@ -9624,14 +9640,16 @@ impl<'a> Lower<'a> {
                         args.extend([index, off]);
                         let s = self.s.m.i32(stride);
                         let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
-                        (byte, bytes) = (self.s.m.bin(self.cur, Bin::Add, row, off), 4 * count);
+                        let width = self.s.m.i32(4 * count);
+                        (byte, bytes) = (self.s.m.bin(self.cur, Bin::Add, row, off), width);
                     }
                     None => {
                         let n = 4 * count;
                         let (h, off) =
                             self.raw_view(site, src, off, n, (11 | u, 0), true, guard)?;
                         args.extend([h, off, iu]);
-                        (byte, bytes) = (off, n);
+                        let width = self.s.m.i32(n);
+                        (byte, bytes) = (off, width);
                     }
                 }
                 args.extend(&vals);
@@ -10964,6 +10982,64 @@ mod tests {
         // host to invalidate its cached view of a buffer.
         assert!(lowers(&[0xE1C4_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl0_inv");
         assert!(lowers(&[0xE1C8_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl1_inv");
+    }
+
+    /// A full typed store to element `s0` through the table at `s1`, with
+    /// `soffset` in the MUBUF instruction's scalar-source field.
+    fn typed_store_words(soffset: u8) -> Vec<u32> {
+        let mut words = vec![
+            0xBE84_0301, // s_mov_b32 s4, s1
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0x7E00_0200, // v_mov_b32 v0, s0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        ];
+        words.extend((1..=4).map(|v| 0x7E00_0000 | (v as u32) << 17 | 0x01 << 9 | 0x80));
+        words.extend([
+            0xE01C_2000,
+            0x8002_0100 | (soffset as u32) << 24, // buffer_store_format_xyzw v[1:4], v0, s[8:11], 0 idxen
+            S_ENDPGM,
+        ]);
+        words
+    }
+
+    #[test]
+    fn typed_stores_refuse_register_and_immediate_soffsets() {
+        let layout = || vec![root(RootType::Constants, 0, 0), root(RootType::Table, 1, 1)];
+        // RGBA32 and RGB32 use the same full-store MUBUF form. The mark width
+        // comes from the host's stride table; the used-resource stride here
+        // keeps both descriptor layouts in the regression matrix.
+        for (format, stride) in [("RGBA32", 16), ("RGB32", 12)] {
+            let used = || {
+                vec![UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride,
+                    dwords: 4,
+                    user_data: 1,
+                    slot: 1,
+                }]
+            };
+            // A register and an inline constant both make an instruction-valued
+            // offset. Neither may be silently dropped until offsets can fold into
+            // the typed element index. Inline zero is the accepted no-offset form.
+            for (source, soffset) in [("register", 6), ("immediate", 132)] {
+                let Err(crate::ShaderError::Unsupported { what, .. }) =
+                    lower_with(&typed_store_words(soffset), layout(), used())
+                else {
+                    panic!("translated a {format} typed store with a {source} soffset");
+                };
+                assert_eq!(
+                    what, "a typed buffer store at an offset",
+                    "{format} {source} soffset"
+                );
+            }
+            lower_with(&typed_store_words(128), layout(), used())
+                .unwrap_or_else(|e| panic!("{format} inline zero soffset: {e}"));
+        }
     }
 
     #[test]
