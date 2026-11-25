@@ -2131,6 +2131,72 @@ uint ps() : SV_Target { return 1; }
         out
     }
 
+    /// Three-channel typed SRVs keep their 12-byte element stride and w = 1
+    /// through the host descriptor, including after the title changes them.
+    #[test]
+    fn three_channel_typed_srvs_reach_shaders_with_their_own_stride() {
+        if !crate::shader_cache::under_wine() {
+            return;
+        }
+        let Some(host) = crate::host::host() else { return };
+        let (src, dst) = (buffer(4 * 12), buffer(256));
+        let (src_bytes, dst_bytes) = (
+            crate::resource::buffer_bytes(src).unwrap().0,
+            crate::resource::buffer_bytes(dst).unwrap().0,
+        );
+        let data = [
+            1000u32, 2000, 3000, 1003, 2003, 3003, 1006, 2006, 3006, 1009, 2009, 3009,
+        ];
+        // SAFETY: the source buffer's 48 bytes.
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr().cast::<u8>(), src_bytes, 48) };
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 2, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let title_heap = crate::descriptor::heap(heap);
+        let srv_words = [6, 1, 0x1688, 0, 0, 0, 4, 0, 0, 0];
+        let uav_words = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        crate::descriptor::create_srv(null, src, &srv_words, title_heap.start);
+        crate::descriptor::create_uav(null, dst, null, &uav_words, title_heap.start + 32);
+        let heap_host = title_heap.host().expect("a host view heap");
+        assert!(heap_host.made(0) && heap_host.kept(0), "the source view is made");
+        assert!(heap_host.made(1) && heap_host.kept(1), "the output view is made");
+        let source = r#"
+Buffer<float4> src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+[numthreads(1, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    dst.Store4(id.x * 16, asuint(src[id.x]));
+}
+"#;
+        let (root, pso) = compile_cs(
+            source,
+            &[Param::Table(&[srv(0, 1)]), Param::Table(&[uav(0, 1)])],
+        );
+        let list = host.new_list().unwrap();
+        // SAFETY: an open list and live objects of ours.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
+            list.list.SetComputeRootDescriptorTable(1, heap_host.gpu(1));
+            list.list.SetPipelineState(&pso);
+            list.list.Dispatch(4, 1, 1);
+        }
+        list.close();
+        crate::shadow::find(src_bytes as u64, 48)
+            .expect("the source's host copy")
+            .refresh(&list, src_bytes as u64, 48);
+        host.execute(&[&list]);
+        let out = crate::shadow::find(dst_bytes as u64, 256).expect("the output's host copy");
+        let one = 0x3f80_0000;
+        assert_eq!(
+            out.read_host(dst_bytes as u64, 16),
+            [1000, 2000, 3000, one, 1003, 2003, 3003, one, 1006, 2006, 3006, one, 1009, 2009, 3009, one]
+        );
+    }
+
     /// Root views (`victory_shader::emit`, "Root SRVs and root UAVs") through
     /// our device: a raw view of the host copy holding the root address,
     /// brought up to date from there to the copy's end, so data 1.5 MiB past

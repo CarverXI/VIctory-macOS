@@ -17,6 +17,7 @@
 //! (`crate::bindless`).
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -46,11 +47,62 @@ pub(crate) struct Shadow {
     /// 64 KiB title page it touches (tracked memory only): writes through
     /// views of it are marked there ([`Shadow::mark_entry`]).
     marks: Option<u32>,
+    /// Widened three-channel views reading this copy, refreshed when their
+    /// source bytes change.
+    widened: Mutex<Vec<(u64, u64, std::sync::Weak<Widened>)>>,
+    has_widened: AtomicBool,
     /// Where it starts in `buffer` (0 but for copies sharing a buffer), and
     /// the run of the shared buffer it holds ([`Arena`]), given back when it
     /// goes.
     base: u64,
     slice: Option<Slice>,
+}
+
+/// A 16-byte-element host copy of a three-channel 32-bit buffer view. D3DMetal
+/// reads R32G32B32 typed SRVs as R32G32; an R32G32B32A32 view over this copy
+/// keeps the title's 12-byte stride and supplies w = 1.
+pub(crate) struct Widened {
+    pub(crate) buffer: ID3D12Resource,
+    data: *mut u8,
+    start: u64,
+    len: u64,
+}
+
+// SAFETY: the resource is free-threaded; `data` is a persistent mapping
+// written only by the submitting thread.
+unsafe impl Send for Widened {}
+// SAFETY: as above.
+unsafe impl Sync for Widened {}
+
+impl Widened {
+    fn refresh(&self, shadow: &Shadow, from: usize, to: usize) {
+        let start = self.start as usize;
+        let end = start + self.len as usize;
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return;
+        }
+        let first = (from - start) / 12;
+        let last = (to - start).div_ceil(12);
+        // SAFETY: the source range is inside the shadow and the destination
+        // has one 16-byte element for each 12 source bytes.
+        unsafe {
+            let source = shadow.data.add(start - shadow.start as usize);
+            for i in first..last {
+                let at = source.add(i * 12);
+                let to = self.data.add(i * 16);
+                std::ptr::copy_nonoverlapping(at, to, 12);
+                to.add(12).cast::<u32>().write_volatile(0x3f80_0000);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_host(&self, n: usize) -> Vec<u32> {
+        assert!(4 * n <= (self.len / 12 * 16) as usize);
+        // SAFETY: inside the mapped widened buffer; the GPU is done with it.
+        unsafe { std::slice::from_raw_parts(self.data.cast::<u32>(), n).to_vec() }
+    }
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
@@ -125,8 +177,11 @@ impl Shadow {
     pub(crate) fn write_host(&self, address: u64, bytes: &[u8]) {
         let at = (address - self.start) as usize;
         assert!(at + bytes.len() <= self.len as usize);
-        // SAFETY: inside the mapping (checked).
+        // SAFETY: inside the mapping (checked); the GPU is done with it.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(at), bytes.len()) };
+        if self.has_widened.load(Ordering::Acquire) {
+            self.refresh_widened(address as usize, address as usize + bytes.len());
+        }
     }
 
     /// Up to 64 bytes of the copy at title address `address`, as floats, and
@@ -149,6 +204,65 @@ impl Shadow {
     /// Where the title memory it copies starts, and its length.
     pub(crate) fn range(&self) -> (u64, u64) {
         (self.start, self.len)
+    }
+
+    /// A widened copy of `len` bytes at `address` for a three-channel
+    /// 32-bit typed SRV. The source stays in its normal 12-byte layout;
+    /// this copy has 16-byte elements with w = 1.
+    pub(crate) fn widened(self: &Arc<Self>, address: u64, len: u64) -> Option<Arc<Widened>> {
+        if len == 0 || !len.is_multiple_of(12) {
+            return None;
+        }
+        let found = || {
+            self.widened
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .find(|&&(start, size, _)| start == address && size == len)
+                .and_then(|(_, _, view)| view.upgrade())
+        };
+        if let Some(view) = found() {
+            return Some(view);
+        }
+        let count = len / 12;
+        let (buffer, data) = host()?.upload_buffer(count * 16)?;
+        let widened = Arc::new(Widened {
+            buffer,
+            data,
+            start: address,
+            len,
+        });
+        widened.refresh(self, address as usize, (address + len) as usize);
+        let mut views = self.widened.lock().unwrap_or_else(|e| e.into_inner());
+        // Another thread may have made the same view while this one was
+        // being allocated.
+        if let Some(view) = views
+            .iter()
+            .find(|&&(start, size, _)| start == address && size == len)
+            .and_then(|(_, _, view)| view.upgrade())
+        {
+            return Some(view);
+        }
+        if views.len().is_power_of_two() {
+            views.retain(|(_, _, view)| view.strong_count() > 0);
+        }
+        views.push((address, len, Arc::downgrade(&widened)));
+        drop(views);
+        self.has_widened.store(true, Ordering::Release);
+        Some(widened)
+    }
+
+    fn refresh_widened(&self, from: usize, to: usize) {
+        let views: Vec<_> = self
+            .widened
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(|(_, _, view)| view.upgrade())
+            .collect();
+        for view in views {
+            view.refresh(self, from, to);
+        }
     }
 
     /// After a submission whose shaders wrote title memory at addresses they
@@ -223,6 +337,8 @@ impl Shadow {
             pending: Mutex::default(),
             before: Mutex::default(),
             marks,
+            widened: Mutex::default(),
+            has_widened: AtomicBool::new(false),
             base: slice.map_or(0, |s| s.offset),
             slice,
         });
@@ -403,6 +519,9 @@ impl Shadow {
                     }
                     synced.push((start + at) / PAGE);
                 }
+                if self.has_widened.load(Ordering::Acquire) {
+                    self.refresh_widened(start + at, start + at + n);
+                }
                 at += n;
             }
             // Pages made equal to title memory are current in the copy, so
@@ -497,6 +616,9 @@ impl Shadow {
             };
             if differs {
                 writes.push((from, title));
+            }
+            if self.has_widened.load(Ordering::Acquire) {
+                self.refresh_widened(from, to);
             }
             // Equal to title memory now: taken, unless it holds the page in part.
             if from == page && to == page + PAGE {
@@ -635,6 +757,9 @@ impl Shadow {
             for (a, b) in unmapped {
                 // SAFETY: inside the mapping (`take_split` cuts to the buffer).
                 unsafe { self.data.add(a - self.start as usize).write_bytes(0, b - a) };
+                if self.has_widened.load(Ordering::Acquire) {
+                    self.refresh_widened(a, b);
+                }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::Unmapped, (b - a) as u64);
             }
@@ -678,6 +803,9 @@ impl Shadow {
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        if self.has_widened.load(Ordering::Acquire) {
+            self.refresh_widened(from, to);
+        }
         to - from
     }
 }

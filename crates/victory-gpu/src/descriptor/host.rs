@@ -980,6 +980,16 @@ fn view_kind(view: &View) -> u32 {
     }
 }
 
+/// The four-channel host format for a three-channel 32-bit typed SRV.
+fn widened_format(format: i32) -> Option<DXGI_FORMAT> {
+    match format {
+        6 => Some(DXGI_FORMAT_R32G32B32A32_FLOAT),
+        7 => Some(DXGI_FORMAT_R32G32B32A32_UINT),
+        8 => Some(DXGI_FORMAT_R32G32B32A32_SINT),
+        _ => None,
+    }
+}
+
 /// Whether a DXGI format is an integer one, and if so whether signed:
 /// `Some(false)` for `UINT`, `Some(true)` for `SINT`, `None` otherwise.
 fn integer_format(format: u32) -> Option<bool> {
@@ -1145,10 +1155,19 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
 /// The host resource a slot made by [`make`] views, and the view's own copy
 /// of title memory ([`crate::shadow::for_view`]): the slot holds it, so that
 /// draws reading the view find and refresh that copy.
-type Held = (
-    ID3D12Resource,
-    Option<std::sync::Arc<crate::shadow::Shadow>>,
-);
+type Held = (ID3D12Resource, Option<HeldSource>);
+
+/// The fields keep the normal and widened copies alive for as long as the
+/// slot shows them.
+#[allow(dead_code)]
+enum HeldSource {
+    Shadow(std::sync::Arc<crate::shadow::Shadow>),
+    /// A widened three-channel view and the normal shadow it reads.
+    Widened(
+        std::sync::Arc<crate::shadow::Widened>,
+        std::sync::Arc<crate::shadow::Shadow>,
+    ),
+}
 
 /// What a slot made by [`make`] holds, if anything.
 type Kept = Option<Held>;
@@ -1192,12 +1211,32 @@ fn buffer_srv(
         return None;
     }
     let host = host()?;
+    if crate::shader_cache::under_wine()
+        && matches!(desc.Format.0, 6..=8)
+        && let Some(widened) = shadow.widened(start, u64::from(count) * 12)
+    {
+        desc.Format = widened_format(desc.Format.0).expect("a three-channel format");
+        buffer.FirstElement = 0;
+        buffer.NumElements = count;
+        // SAFETY: a live widened buffer and a slot of our heap.
+        unsafe {
+            host.device
+                .CreateShaderResourceView(&widened.buffer, Some(&desc), at)
+        };
+        return Some(Some((
+            widened.buffer.clone(),
+            Some(HeldSource::Widened(widened, shadow.clone())),
+        )));
+    }
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
-    Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
+    Some(Some((
+        shadow.buffer.clone(),
+        own.then(|| HeldSource::Shadow(shadow)),
+    )))
 }
 
 /// Whether `count` elements of `element` bytes from element `first` lie in
@@ -1262,7 +1301,10 @@ fn buffer_uav(
         )
     };
     MARK.with(|m| m.set(shadow.mark_entry(start)));
-    Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
+    Some(Some((
+        shadow.buffer.clone(),
+        own.then(|| HeldSource::Shadow(shadow)),
+    )))
 }
 
 thread_local! {
@@ -1759,6 +1801,102 @@ mod tests {
         let srv = View::Shader(0, Some([62, 1, 5768, 0, 0, 0, 64, 0, 0, 0]));
         assert_eq!(view_kind(&srv), VIEW_INTEGER, "R8_UINT");
         assert_eq!(view_stride(&uav(12, 0, 0)) | view_kind(&uav(12, 0, 0)), 8 | VIEW_INTEGER);
+        assert_eq!(widened_format(6), Some(DXGI_FORMAT_R32G32B32A32_FLOAT));
+        assert_eq!(widened_format(7), Some(DXGI_FORMAT_R32G32B32A32_UINT));
+        assert_eq!(widened_format(8), Some(DXGI_FORMAT_R32G32B32A32_SINT));
+        assert_eq!(widened_format(2), None);
+    }
+
+    /// Three-channel 32-bit SRVs are backed by a widened copy on hosts that
+    /// read R32G32B32 as R32G32. The copy keeps 12-byte source elements,
+    /// supplies w = 1 and follows later title writes.
+    #[test]
+    fn three_channel_srvs_use_a_widened_refreshed_copy() {
+        if !crate::shader_cache::under_wine() {
+            return;
+        }
+        let Some(host) = host() else { return };
+        let p = crate::watch::tests::pool(1);
+        let len = 4 * 12;
+        let first: [u32; 12] = [
+            1000, 2000, 3000, 1003, 2003, 3003, 1006, 2006, 3006, 1009, 2009, 3009,
+        ];
+        // SAFETY: 48 bytes of our pool page.
+        unsafe { std::ptr::copy_nonoverlapping(first.as_ptr().cast::<u8>(), p as *mut u8, len) };
+        crate::shadow::register(p, p as u64, len as u64);
+        let shadow = crate::shadow::find(p as u64, len as u64).expect("a host copy");
+        shadow.update(p, len);
+
+        // SAFETY: plain descriptor-heap creation.
+        let heap: ID3D12DescriptorHeap = unsafe {
+            host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 2,
+                ..Default::default()
+            })
+        }
+        .expect("a descriptor heap");
+        // SAFETY: a live heap.
+        let at = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32G32B32_FLOAT,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    NumElements: 4,
+                    ..Default::default()
+                },
+            },
+        };
+        let (resource, source) = buffer_srv(p as u64, len as u64, desc, at)
+            .expect("a view")
+            .expect("a kept view");
+        let Some(HeldSource::Widened(widened, _)) = source else {
+            panic!("a widened source");
+        };
+        // SAFETY: a live resource.
+        let made = unsafe { resource.GetDesc() };
+        assert_eq!(made.Width, 4 * 16);
+        let one = 0x3f80_0000;
+        assert_eq!(
+            widened.read_host(16),
+            [1000, 2000, 3000, one, 1003, 2003, 3003, one, 1006, 2006, 3006, one, 1009, 2009, 3009, one]
+        );
+
+        // SAFETY: a live heap; its second slot is one descriptor stride on.
+        let step = unsafe {
+            host.device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+        };
+        let second_at = D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: at.ptr + step as usize,
+        };
+        let (second_resource, second_source) =
+            buffer_srv(p as u64, len as u64, desc, second_at)
+                .expect("a second view")
+                .expect("a second kept view");
+        let Some(HeldSource::Widened(second, _)) = second_source else {
+            panic!("a second widened source");
+        };
+        assert!(
+            std::sync::Arc::ptr_eq(&widened, &second),
+            "one widened copy per range"
+        );
+        drop((second_resource, second));
+
+        let changed = [0x1111_1111, 0x2222_2222, 0x3333_3333];
+        // SAFETY: one 12-byte element of our pool page.
+        unsafe { std::ptr::copy_nonoverlapping(changed.as_ptr().cast::<u8>(), (p + 12) as *mut u8, 12) };
+        assert!(shadow.update(p, len) > 0, "the title write is copied");
+        assert_eq!(
+            widened.read_host(16),
+            [1000, 2000, 3000, one, 0x1111_1111, 0x2222_2222, 0x3333_3333, one, 1006, 2006, 3006, one, 1009, 2009, 3009, one]
+        );
+
+        drop((resource, widened, heap, shadow));
+        crate::shadow::unregister(p, p as u64);
+        crate::watch::tests::free(p);
     }
 
     /// A placed texture's view the title writes into a heap is left null
