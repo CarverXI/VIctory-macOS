@@ -1178,6 +1178,9 @@ impl State {
         if let Some(view) = host.mirror(index, handle, true) {
             readable(list, u, &view, true);
         }
+        if !heap.samplers() {
+            list.defer_slot(&host.viewed, index);
+        }
     }
 
     /// The descriptors a shader reads through tables, made from the
@@ -2243,6 +2246,151 @@ uint ps() : SV_Target { return 1; }
             dwords: 8,
             user_data: 0,
             slot: 0,
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Rewrite {
+        Mirrored,
+        Copied,
+        DuringSubmission,
+    }
+
+    /// A table slot rewritten after its draw is recorded must refresh the
+    /// buffer its host descriptor names at submission, not the old one.
+    #[test]
+    fn a_table_slot_rewritten_before_submission_refreshes_its_new_view() {
+        for mode in [Rewrite::Mirrored, Rewrite::Copied, Rewrite::DuringSubmission] {
+            check_table_slot_rewrite(mode);
+        }
+    }
+
+    /// `Copied` leaves the host mirror to the submission's heap sync;
+    /// `DuringSubmission` rewrites after that sync, before deferred work.
+    fn check_table_slot_rewrite(mode: Rewrite) {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let (a, b, out) = (buffer(256), buffer(256), buffer(256));
+        let (a_bytes, _) = crate::resource::buffer_bytes(a).unwrap();
+        let (b_bytes, _) = crate::resource::buffer_bytes(b).unwrap();
+        let (out_bytes, _) = crate::resource::buffer_bytes(out).unwrap();
+        let memory = (mode == Rewrite::Copied).then(|| crate::watch::tests::pool(1));
+        #[repr(C)]
+        struct Extended {
+            desc: [u32; 4],
+            address: u64,
+            size: u64,
+        }
+        let extended = Extended {
+            desc: [0, 4, 1, 0],
+            address: memory.map_or(0, |memory| memory as u64),
+            size: memory.map_or(0, |_| 4 * 32),
+        };
+        let mut heap = std::ptr::null();
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(
+                std::ptr::null(),
+                std::ptr::from_ref(&extended.desc).cast(),
+                &iid,
+                &mut heap,
+            ),
+            S_OK
+        );
+        let title_heap = crate::descriptor::heap(heap);
+        if let Some(memory) = memory {
+            assert_eq!(
+                title_heap.start,
+                memory as u64,
+                "the placed heap starts at its memory"
+            );
+        }
+        let host_heap = title_heap
+            .host()
+            .unwrap_or_else(|| panic!("a host view heap ({mode:?})"));
+        let (a_bytes, b_bytes, out_bytes) = (a_bytes as u64, b_bytes as u64, out_bytes as u64);
+        let out_copy = crate::shadow::find(out_bytes, 256).expect("the output's host copy");
+        let raw: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        crate::descriptor::create_cbv(
+            std::ptr::null(),
+            &[a_bytes as u32, (a_bytes >> 32) as u32, 256, 0],
+            title_heap.start,
+        );
+        crate::descriptor::create_uav(
+            std::ptr::null(),
+            out,
+            std::ptr::null(),
+            &raw,
+            title_heap.start + 32,
+        );
+        let (root, pso) = compile();
+        let b_desc = [b_bytes as u32, (b_bytes >> 32) as u32, 256, 0];
+        let list = host.new_list().unwrap();
+        if mode == Rewrite::DuringSubmission {
+            let handle = title_heap.start;
+            list.defer(move || crate::descriptor::create_cbv(std::ptr::null(), &b_desc, handle));
+        }
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        state.set_table(true, 0, title_heap.start);
+        assert!(
+            state
+                .tables(&list, &[used(ResourceType::Srv)], true)
+                .is_empty(),
+            "an in-place table"
+        );
+
+        // The title replaces the record after recording, before submission.
+        if mode == Rewrite::Copied {
+            let mut record = [0u32; 8];
+            let at = record.as_mut_ptr() as u64;
+            crate::descriptor::create_cbv(std::ptr::null(), &b_desc, at);
+            // SAFETY: one 32-byte record in each of our allocations.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    record.as_ptr().cast::<u8>(),
+                    title_heap.start as *mut u8,
+                    32,
+                )
+            };
+        } else if mode == Rewrite::Mirrored {
+            crate::descriptor::create_cbv(std::ptr::null(), &b_desc, title_heap.start);
+        }
+        // SAFETY: inside the title buffers.
+        unsafe {
+            (a_bytes as *mut u32).write(0x1111_1111);
+            (b_bytes as *mut u32).write(0x2222_2222);
+        }
+        // SAFETY: an open list and live objects of ours.
+        unsafe {
+            list.list
+                .SetDescriptorHeaps(&[Some(host_heap.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetComputeRootDescriptorTable(0, host_heap.gpu(0));
+            list.list.SetComputeRootDescriptorTable(1, host_heap.gpu(1));
+            list.list.SetComputeRoot32BitConstants(2, 2, [0u32; 2].as_ptr().cast(), 0);
+            list.list.SetPipelineState(&pso);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(
+            out_copy.read_host(out_bytes, 1),
+            [0x2222_2222],
+            "the new descriptor's data ({mode:?})"
+        );
+        assert_eq!(
+            crate::object::slot::<extern "system" fn(This) -> u32>(heap, 0x10)(heap),
+            0
+        );
+        if let Some(memory) = memory {
+            crate::watch::tests::free(memory);
         }
     }
 

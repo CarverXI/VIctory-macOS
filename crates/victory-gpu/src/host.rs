@@ -978,6 +978,9 @@ enum Step {
     /// once per submission, whichever lists ask, until a `Copy` into it or a
     /// `Run` intervenes.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// Brings the current buffer view of a table slot up to date: the title
+    /// may have rewritten the slot since the draw was recorded.
+    Slot(std::sync::Arc<crate::bindless::Viewed>, u32),
     /// Work that may write title memory.
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
@@ -1014,6 +1017,8 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Table slots asked for since the last title write (heap, index).
+    slots: std::collections::HashSet<(usize, u32)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -2163,6 +2168,7 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.slots.clear();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -2188,6 +2194,16 @@ impl HostList {
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
+        }
+    }
+
+    /// Brings the buffer range of the view currently in `index` up to date
+    /// when the list is submitted, once until a title write intervenes.
+    pub(crate) fn defer_slot(&self, viewed: &std::sync::Arc<crate::bindless::Viewed>, index: u32) {
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(viewed) as usize, index);
+        if deferred.slots.insert(key) {
+            deferred.copies.push(Step::Slot(viewed.clone(), index));
         }
     }
 
@@ -2381,8 +2397,10 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.refreshed.clear();
+        deferred.slots.clear();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -2413,7 +2431,7 @@ impl HostList {
             let _timed = crate::watch::Timed(
                 started,
                 match step {
-                    Step::Refresh(..) => C::StepRefreshUs,
+                    Step::Refresh(..) | Step::Slot(..) => C::StepRefreshUs,
                     Step::Copy(..) | Step::Fill(..) => C::StepCopyUs,
                     Step::Run(_) | Step::Host(_) => C::StepWorkUs,
                     Step::GpuWrite(..) => C::StepGpuWriteUs,
@@ -2449,6 +2467,10 @@ impl HostList {
                         add(C::RefreshBytes, *len as u64);
                     }
                     batch.add(shadow, *address, *len);
+                    continue;
+                }
+                Step::Slot(viewed, index) => {
+                    crate::bindless::refresh_slot(viewed, *index, |s, a, l| batch.add(s, a, l));
                     continue;
                 }
                 Step::Run(work) | Step::Host(work) => {
