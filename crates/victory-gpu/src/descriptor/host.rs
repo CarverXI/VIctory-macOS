@@ -1236,6 +1236,19 @@ fn buffer_uav(
         once!(len, "unordered buffer view of elements without a size");
         return None;
     }
+    let format = desc.Format.0;
+    let typed_three_channel = buffer.StructureByteStride == 0
+        && buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 == 0
+        && matches!(format, 6..=8);
+    // D3DMetal 3.0 reports typed-UAV support for these formats, then tries
+    // to make an unsupported three-channel Metal format and aborts inside the
+    // void CreateUnorderedAccessView call. D3D12 exposes no D3DMetal version,
+    // so keep the Wine-wide guard until 4.0 is characterized. The caller
+    // installs a null UAV and keeps no resource or mark.
+    if typed_three_channel && crate::shader_cache::under_wine() {
+        once!(format, "three-channel typed unordered buffer view under Wine");
+        return None;
+    }
     let start = address + buffer.FirstElement * element;
     let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
     // SAFETY: a live buffer.
@@ -1252,6 +1265,15 @@ fn buffer_uav(
         return None;
     }
     let host = host()?;
+    if typed_three_channel {
+        // The COM method has no HRESULT. On native hosts, reject a format
+        // the device does not advertise and a device already removed.
+        // SAFETY: plain device queries.
+        if unsafe { host.device.GetDeviceRemovedReason() }.is_err() || !typed_store(format as u32) {
+            once!(format, "three-channel typed unordered buffer view the host cannot make");
+            return None;
+        }
+    }
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device.CreateUnorderedAccessView(
@@ -1261,6 +1283,13 @@ fn buffer_uav(
             at,
         )
     };
+    // CreateUnorderedAccessView is void and cannot report failure directly.
+    // If it removed the native device, do not keep its descriptor or mark.
+    // SAFETY: a plain device query.
+    if typed_three_channel && unsafe { host.device.GetDeviceRemovedReason() }.is_err() {
+        once!(format, "device removed making a three-channel typed unordered buffer view");
+        return None;
+    }
     MARK.with(|m| m.set(shadow.mark_entry(start)));
     Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
 }
@@ -2167,5 +2196,182 @@ mod tests {
         // The array's own view: a 2D array, levels 0-10.
         let words = image_words(&array, None, false);
         assert_eq!(words[1..], [3 << 30, 255 | 599 << 14, 0xFAC | 10 << 16 | 13 << 28]);
+    }
+
+    /// Wine's D3DMetal aborts while creating these typed UAVs. The production
+    /// path must leave a null descriptor, no kept resource and no write mark.
+    fn three_channel_uav_falls_back_under_wine(format: DXGI_FORMAT) {
+        let Some(host) = host() else { return };
+        let Some(heap) = HostHeap::new(false, 4) else { return };
+        let p = crate::watch::tests::pool(1);
+        crate::shadow::register(p, p as u64, 64);
+        let mut resource = [0u32; 14];
+        resource[0] = 1; // buffer
+        resource[4] = 64;
+        let mut words = [0u32; 16];
+        words[0] = format.0 as u32;
+        words[1] = 1; // buffer
+        words[4] = 1; // one 12-byte element
+        (words[10], words[11]) = (p as u32, (p >> 32) as u32);
+        let slot = heap.dynamic(1).expect("a dynamic slot");
+        heap.make_at(slot, &View::Placed(true, resource, words));
+        assert!(!heap.kept(slot), "a refused UAV keeps no resource");
+        let marks = heap.marks.as_ref().expect("the write-mark table").1;
+        // SAFETY: two dwords of the mapped table for this live slot.
+        let mark = unsafe { std::slice::from_raw_parts((marks as *const u32).add(slot as usize * 2), 2) };
+        assert_eq!(mark, [victory_shader::emit::VIEW_MARK_NONE, 0], "a refused UAV has no write mark");
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok(), "the null fallback leaves the device alive");
+        crate::shadow::unregister(p, p as u64);
+        crate::watch::tests::free(p);
+    }
+
+    /// Synthetic hardware characterization: create a typed R32G32B32 UAV,
+    /// store one three-component element, and copy the raw bytes back. Wine
+    /// exercises the safe fallback instead, because raw creation aborts.
+    fn characterize_r32g32b32(format: DXGI_FORMAT, scalar: &str, value: &str, expected: [u32; 3]) {
+        eprintln!("typed UAV characterization: {format:?}");
+        if crate::shader_cache::under_wine() {
+            three_channel_uav_falls_back_under_wine(format);
+            eprintln!("typed UAV characterization: Wine fallback passed");
+            return;
+        }
+        let Some(host) = host() else {
+            eprintln!("typed UAV characterization: no host device");
+            return;
+        };
+        let device = &host.device;
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: format, ..Default::default() };
+        // SAFETY: a plain query into a struct of its size.
+        let support_result = unsafe {
+            device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        };
+        eprintln!("typed UAV characterization: format support {support_result:?}, Support1={:#x}", support.Support1.0);
+        if support_result.is_err()
+            || support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 == 0
+        {
+            eprintln!("typed UAV characterization: host does not advertise typed UAV support; skipped");
+            return;
+        }
+        let mut made: Option<ID3D12Resource> = None;
+        // SAFETY: a plain committed buffer description.
+        unsafe {
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: 256,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: DXGI_FORMAT_UNKNOWN,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    None,
+                    &mut made,
+                )
+                .unwrap();
+        }
+        let buffer = made.unwrap();
+        // SAFETY: a plain shader-visible descriptor heap.
+        let heap: ID3D12DescriptorHeap = unsafe {
+            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 1,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                ..Default::default()
+            })
+        }
+        .unwrap();
+        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV { NumElements: 1, ..Default::default() },
+            },
+        };
+        // SAFETY: a live buffer and one slot of our heap.
+        unsafe {
+            let cpu = heap.GetCPUDescriptorHandleForHeapStart();
+            device.CreateUnorderedAccessView(&buffer, None::<&ID3D12Resource>, Some(&desc), cpu);
+        }
+        // SAFETY: a plain device query.
+        let removed = unsafe { device.GetDeviceRemovedReason() };
+        eprintln!("typed UAV characterization: after creation {removed:?}");
+        removed.expect("creating the typed UAV leaves the device alive");
+        let source = format!(
+            "// {format:?}\nRWBuffer<{scalar}3> output : register(u0);\n[numthreads(1, 1, 1)]\nvoid main() {{ output[0] = {scalar}3({value}); }}\n"
+        );
+        let (root, pso) = crate::compute::pipeline(
+            &source,
+            windows::core::s!("typed uav characterization"),
+            0,
+            &[crate::compute::Param::Table(&[crate::compute::uav(0, 1)])],
+        )
+        .expect("the typed-store shader compiles");
+        let list = host.new_list().unwrap();
+        let (readback, data) = list.readback(host, 256).unwrap();
+        // SAFETY: an open list, live objects, and a descriptor in our heap.
+        unsafe {
+            let gpu = heap.GetGPUDescriptorHandleForHeapStart();
+            list.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetComputeRootDescriptorTable(0, gpu);
+            list.list.SetPipelineState(&pso);
+            list.list.Dispatch(1, 1, 1);
+            list.list.ResourceBarrier(&[crate::host::transition(
+                &buffer,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.list.CopyResource(&readback, &buffer);
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: execute waited for the copy; the mapped readback is 256 bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), 36) };
+        eprintln!("typed UAV characterization: raw readback {bytes:?}");
+        let want: Vec<u8> = expected.iter().flat_map(|word| word.to_le_bytes()).collect();
+        assert_eq!(bytes, want, "typed UAV store/raw readback");
+    }
+
+    #[test]
+    fn characterize_r32g32b32_float_typed_uav() {
+        characterize_r32g32b32(
+            DXGI_FORMAT_R32G32B32_FLOAT,
+            "float",
+            "1.25, -2.5, 3.75",
+            [1.25f32.to_bits(), (-2.5f32).to_bits(), 3.75f32.to_bits()],
+        );
+    }
+
+    #[test]
+    fn characterize_r32g32b32_uint_typed_uav() {
+        characterize_r32g32b32(
+            DXGI_FORMAT_R32G32B32_UINT,
+            "uint",
+            "0x11223344u, 0x55667788u, 0x99aabbccu",
+            [0x1122_3344, 0x5566_7788, 0x99aa_bbcc],
+        );
+    }
+
+    #[test]
+    fn characterize_r32g32b32_sint_typed_uav() {
+        characterize_r32g32b32(
+            DXGI_FORMAT_R32G32B32_SINT,
+            "int",
+            "-1, -2, -3",
+            [(-1i32) as u32, (-2i32) as u32, (-3i32) as u32],
+        );
     }
 }
