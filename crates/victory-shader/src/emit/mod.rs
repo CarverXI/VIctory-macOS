@@ -874,7 +874,8 @@ mod tests {
                 );
                 let features =
                     u64::from_le_bytes(host.part(FourCC::SFI0).unwrap().data.try_into().unwrap());
-                assert_ne!(features & (1 << 22), 0, "Barycentrics feature bit");
+                assert_ne!(features & (1 << 17), 0, "Barycentrics feature bit");
+                assert_eq!(features & (1 << 22), 0, "do not claim typed 64-bit atomics");
                 let psv = host.part(FourCC::PSV0).unwrap().data;
                 let sample_mode = bit == 0 || bit == 4;
                 assert_eq!(psv[5], u8::from(sample_mode), "sample frequency");
