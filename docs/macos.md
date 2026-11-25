@@ -58,6 +58,20 @@ Under Wine, `D3DCompile` is Wine's HLSL compiler (vkd3d-shader). In CrossOver 26
 - Shader model 5.1 resource arrays are not implemented, bounded or unbounded (`E_NOTIMPL`), and `NonUniformResourceIndex` is not defined. So `lists_share_a_table_and_copies_keep_their_views` skips under Wine. Embedding FXC's bytes instead is ruled out by VIctory's asset policy, which refuses long runs of embedded hex.
 - It still compiles plain `cs_5_1` shaders, and D3DMetal runs their bytecode.
 
+### Building the indirect argument clamp with DXC
+
+If you have DXC, you can build the 64-thread argument clamp from its HLSL source when cross-compiling VIctory. The compiled shader stays in Cargo’s build output. Set `VICTORY_HELPER_DXC` to a native DXC executable, or use the Wine wrapper with an x64 Microsoft DXC distribution:
+
+```sh
+export DXC_WINE="$WINE"
+export DXC_EXE="/absolute/path/to/dxc.exe"
+export VICTORY_HELPER_DXC="$PWD/tools/macos/dxc-wine.sh"
+cargo build --locked --target x86_64-pc-windows-gnullvm -p victory
+tools/macos/test-wine.sh -p victory-gpu --lib hardware_uses_precompiled_clamp -- --ignored
+```
+
+Keep the compiler and its companion DLLs together. On success the runtime logs `argument clamp: using precompiled 64-thread shader`. Without a configured compiler, or if the device rejects the compiled shader, the existing runtime compilation paths remain available.
+
 D3DMetal has no Metal format for `R10G10B10_XR_BIAS_A2_UNORM`. It refuses any castable format list that names it, and creating a texture in that format stops the process in Metal's validation. `castable` leaves it out, so 4-byte colour textures of one memory share one host texture under D3DMetal too.
 
 It also refuses any list that names the packed formats `R8G8_B8G8_UNORM` and `G8R8_G8B8_UNORM` (68 and 69), which every 2-byte format's list did, so no 2-byte texture took castable formats. After the first refusal, VIctory gave each format of one memory its own host texture, and a run on a 16 GB M5 grew to 6.9 GB of host textures and ran out of GPU memory (issue #15). `castable` leaves both out. With all three left out, D3DMetal 4.0 beta 3 takes all 96 lists `castable` makes, checked by creating each format's texture with its list.
