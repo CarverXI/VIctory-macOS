@@ -1300,6 +1300,8 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        #[cfg(feature = "diagnostics")]
+        batch.log_refreshes(*submitted + 1, runs.len());
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
@@ -2515,6 +2517,10 @@ struct Batch {
         usize,
         (std::sync::Arc<crate::shadow::Shadow>, crate::ranges::Ranges),
     >,
+    /// Totals and the largest ranges refreshed by this submission, for a
+    /// bounded diagnostics line. No range contents or view attribution.
+    #[cfg(feature = "diagnostics")]
+    summary: crate::ranges::RefreshSummary,
 }
 
 /// How far apart a copy's pending ranges may be and still be done as one,
@@ -2591,7 +2597,11 @@ impl Batch {
                 let copied = shadow.update(from, to - from);
                 let us = started.elapsed().as_micros() as u64;
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::range(from, to - from, us, 0);
+                {
+                    crate::copystat::range(from, to - from, us, 0);
+                    self.summary
+                        .record(from as u64, (to - from) as u64, shadow.gpu(from as u64));
+                }
                 PREPARING[0].fetch_add(us, Ordering::Relaxed);
                 PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
                 total += copied;
@@ -2604,6 +2614,19 @@ impl Batch {
             }
         }
         total
+    }
+
+    /// Logs one compact line for the submission, if it refreshed title memory.
+    #[cfg(feature = "diagnostics")]
+    fn log_refreshes(&self, submission: u64, lists: usize) {
+        if !self.summary.is_empty() {
+            tracing::info!(
+                submission,
+                lists,
+                "title-memory refreshes: {}",
+                self.summary
+            );
+        }
     }
 }
 
