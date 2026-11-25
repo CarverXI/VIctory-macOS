@@ -64,6 +64,8 @@ It also refuses any list that names the packed formats `R8G8_B8G8_UNORM` and `G8
 
 D3DMetal rounds float depth down when it stores 24-bit depth (a clear to 0.5 stores 8388607, not 8388608), where Windows GPUs round to nearest.
 
+D3DMetal 4.0 beta 3 reports support for `R32G32B32_FLOAT`, `_UINT` and `_SINT` typed buffer SRVs, but reads them as `R32G32`: later elements shift and z is zero. Under Wine, VIctory backs these views with a cached 16-byte-element copy of the source shadow. The copy keeps the title's 12-byte stride and supplies a format-correct w (`1.0f` bits for FLOAT, integer `1` for UINT and SINT). It refreshes with the source shadow, and views of the same range and w share one copy. This is a separate host copy, so an SRV and UAV aliasing the same title bytes within one submission do not see each other's writes through this workaround.
+
 D3DMetal 3.0, as bundled with CrossOver 26.2 and 26.3, returns zeros when a 24-bit depth texture (`R24G8_TYPELESS` or `D24_UNORM_S8_UINT`) is filled by a copy or copied out, while a clear reads back correctly in a shader (#33, with a standalone repro). 32-bit depth works. GPTK 4.0 beta 3 does not have this problem, and `a_depth_texture_written_through_unordered_views_reads_as_depth` passes there, so VIctory needs D3DMetal 4.0 or newer for depth copies. The test stays as it is on 3.0 so the failure remains visible.
 
 ## Route A: next steps
