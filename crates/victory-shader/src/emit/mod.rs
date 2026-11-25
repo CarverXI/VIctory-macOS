@@ -465,8 +465,8 @@ pub fn emit_with(
             (3, _) => 4,
             // Direct console reads below select the exact sample/centroid
             // mode. DXIL defaults index 0 to perspective and index 1 to affine.
-            (23, 9) if e.index == 1 => 4,
-            (23, 9) => 2,
+            (28, 9) if e.index == 1 => 4,
+            (28, 9) => 2,
             // Constant, as DXC declares it (the AMD compiler crashed on a
             // front face without a mode).
             (13, _) => 1,
@@ -608,7 +608,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             68 => 18,
             69 => 20,
             70 => 15,
-            23 => 23, // barycentrics
+            23 => 28, // D3D_NAME_BARYCENTRICS -> DXIL semantic kind
             25 => 30, // cull primitive
             _ => {
                 return Err(ShaderError::Unsupported {
@@ -887,7 +887,7 @@ mod tests {
         let input = SigElement {
             name: "SV_Barycentrics".into(),
             index: 1,
-            kind: 23,
+            kind: 28,
             comp: 9,
             interp: 4,
             row: None,
@@ -901,7 +901,7 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].name, "SV_Barycentrics");
         assert_eq!(parsed[0].index, 1);
-        assert_eq!(parsed[0].kind, 23);
+        assert_eq!(parsed[0].kind, 28);
         assert_eq!(parsed[0].comp, 9);
         assert_eq!(parsed[0].row, None);
         assert_eq!(parsed[0].cols, 3);

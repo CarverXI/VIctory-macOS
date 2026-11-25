@@ -1494,7 +1494,7 @@ impl<'a> Lower<'a> {
             .s
             .inputs
             .iter()
-            .position(|e| e.kind == 23 && e.index == semantic_index)
+            .position(|e| e.kind == 28 && e.index == semantic_index)
         {
             Some(id) if self.s.inputs[id].usage == 0 => {
                 self.s.inputs[id].interp = interp;
@@ -1508,7 +1508,7 @@ impl<'a> Lower<'a> {
                 self.s.inputs.push(SigElement {
                     name: "SV_Barycentrics".into(),
                     index: semantic_index,
-                    kind: 23,
+                    kind: 28,
                     comp: 9,
                     interp,
                     row: None,
