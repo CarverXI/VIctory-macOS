@@ -596,7 +596,12 @@ impl Shadow {
     /// Rosetta) is copied whole, as [`Shadow::update_free`] copies it.
     fn update_busy(&self, from: usize, to: usize) -> usize {
         let runs = match &self.tracked {
-            Some(t) => t.take(from, to),
+            Some(t) => {
+                let mut runs = t.take(from, to);
+                runs.extend(t.untracked(from, to));
+                runs.sort_unstable();
+                runs
+            }
             None => vec![(from, to)],
         };
         if runs.is_empty() {
@@ -1453,6 +1458,93 @@ pub(crate) mod tests {
         assert_eq!(copy.read_host(word as u64, 1), [0x5678], "the title's change reaches the copy");
         assert_eq!(protection(pool), PAGE_READONLY, "the pool is guarded");
         assert_eq!(protection(plain), PAGE_READWRITE, "the plain allocation is not");
+        unregister(pool, pool as u64);
+        // The pages stay allocated (as the other tests' pools): a copy some
+        // page table still holds must not name memory reused meanwhile.
+    }
+
+    /// A busy range over a tracked pool page and the plain allocation after
+    /// it still takes the title's changes on the plain page. The refresh is
+    /// asked for both one changed dword and a view wider than the copy.
+    #[test]
+    fn untracked_title_writes_under_a_mixed_busy_range_are_copied() {
+        use crate::watch::tests::{MEM_WRITE_WATCH, free};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // A pool page and a plain one right after it, in two pages found free
+        // (other tests allocate meanwhile: tried again if taken).
+        let (pool, plain) = (0..8)
+            .find_map(|_| {
+                // SAFETY: a fresh reservation, released at once; then
+                // allocations where it was, freed below.
+                unsafe {
+                    let p = VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE)
+                        as usize;
+                    VirtualFree(p as *mut _, 0, MEM_RELEASE);
+                    let at = |q: usize, kind: u32| {
+                        VirtualAlloc(
+                            q as *const _,
+                            PAGE,
+                            MEM_RESERVE | MEM_COMMIT | kind,
+                            PAGE_READWRITE,
+                        ) as usize
+                    };
+                    let (pool, plain) = (at(p, MEM_WRITE_WATCH), at(p + PAGE, 0));
+                    if p != 0 && pool == p && plain == p + PAGE {
+                        return Some((pool, plain));
+                    }
+                    [pool, plain].into_iter().filter(|&q| q != 0).for_each(free);
+                    None
+                }
+            })
+            .expect("two free pages");
+        let len = 2 * PAGE;
+        register(pool, pool as u64, len as u64);
+        let Some(copy) = find(pool as u64, len as u64) else {
+            unregister(pool, pool as u64);
+            [pool, plain].into_iter().for_each(free);
+            return; // no host GPU here
+        };
+        let tracked = copy.tracked.as_ref().expect("the pool page is tracked");
+        assert_eq!(tracked.untracked(pool, pool + len), [(plain, plain + PAGE)]);
+        assert!(!copy.clean(), "the plain page is always refreshed");
+        let word = (plain + 64) as *mut u32;
+        // SAFETY: (all title reads and writes below) bytes of our allocation.
+        unsafe { word.write_volatile(0x1234_5678) };
+        assert_eq!(
+            copy.update(pool, len),
+            len,
+            "the initial contents reach the copy"
+        );
+        assert_eq!(copy.read_host(word as u64, 1), [0x1234_5678]);
+        // An earlier list declares the whole mixed range as written by shaders.
+        copy.writing(pool, len, false);
+        // SAFETY: a dword of our plain allocation.
+        unsafe { word.write_volatile(0x90ab_cdef) };
+        assert_eq!(copy.update(word as usize, 4), 4, "the busy dword is copied");
+        assert_eq!(
+            copy.read_host(word as u64, 1),
+            [0x90ab_cdef],
+            "the title's dword reaches the copy"
+        );
+        // SAFETY: as above.
+        unsafe { word.write_volatile(0xfedc_ba09) };
+        assert_eq!(
+            copy.update(pool - 16, len + 32),
+            PAGE,
+            "a widened busy view takes the plain page"
+        );
+        assert_eq!(
+            copy.read_host(word as u64, 1),
+            [0xfedc_ba09],
+            "the later dword reaches the copy too"
+        );
+        assert_eq!(
+            copy.copy_back(pool, len),
+            0,
+            "the refreshed copy holds no shader write"
+        );
         unregister(pool, pool as u64);
         // The pages stay allocated (as the other tests' pools): a copy some
         // page table still holds must not name memory reused meanwhile.
