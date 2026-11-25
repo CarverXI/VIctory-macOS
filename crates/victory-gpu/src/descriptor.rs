@@ -456,6 +456,9 @@ pub(crate) enum View {
 struct Views {
     /// Each entry's view and generation.
     list: Vec<(View, u32)>,
+    /// Entries currently in use outside `VIEWS`, by list index. A resource's
+    /// final release waits for these before its views can be freed or reused.
+    pinned: Vec<u32>,
     index: std::collections::BTreeMap<View, u32>,
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
@@ -464,10 +467,12 @@ struct Views {
 
 static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
     list: Vec::new(),
+    pinned: Vec::new(),
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
 });
+static VIEWS_UNPINNED: std::sync::Condvar = std::sync::Condvar::new();
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 impl View {
@@ -496,6 +501,7 @@ fn record(handle: u64, view: View) {
                 }
                 None => {
                     views.list.push((view.clone(), 1));
+                    views.pinned.push(0);
                     views.list.len() as u32 - 1
                 }
             };
@@ -529,18 +535,70 @@ pub(crate) fn forget(resource: usize) {
         }
         views.index.remove(&view);
         views.list[i as usize].1 = generation.wrapping_add(1).max(1);
+        // A host descriptor being made from this view still names the
+        // resource's raw address. `Resource::drop` must not free it until
+        // that use (and any use of the view returned by `mirror`) is done.
+        while views.pinned[i as usize] != 0 {
+            views = VIEWS_UNPINNED
+                .wait(views)
+                .unwrap_or_else(|e| e.into_inner());
+        }
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
     }
 }
 
-/// The view of entry `i` if `generation` is still its own.
-#[cfg(windows)]
-fn view_at(i: u32, generation: u32) -> Option<View> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (*current == generation).then(|| view.clone())
+/// A current view whose resource addresses cannot be freed while it is used.
+/// The entry also cannot be reused until this is dropped.
+#[cfg(any(windows, test))]
+pub(crate) struct ViewPin {
+    index: usize,
+    view: View,
+}
+
+#[cfg(any(windows, test))]
+impl std::ops::Deref for ViewPin {
+    type Target = View;
+
+    fn deref(&self) -> &Self::Target {
+        &self.view
+    }
+}
+
+#[cfg(any(windows, test))]
+impl std::fmt::Debug for ViewPin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.view.fmt(f)
+    }
+}
+
+#[cfg(any(windows, test))]
+impl Drop for ViewPin {
+    fn drop(&mut self) {
+        let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        let pinned = &mut views.pinned[self.index];
+        debug_assert!(*pinned > 0);
+        *pinned -= 1;
+        if *pinned == 0 {
+            VIEWS_UNPINNED.notify_all();
+        }
+    }
+}
+
+/// The view of entry `i` if `generation` is still its own, pinned until the
+/// returned value is dropped.
+#[cfg(any(windows, test))]
+fn view_at(i: u32, generation: u32) -> Option<ViewPin> {
+    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let index = i as usize;
+    let (view, current) = views.list.get(index)?;
+    if *current != generation {
+        return None;
+    }
+    let view = view.clone();
+    views.pinned[index] += 1;
+    Some(ViewPin { index, view })
 }
 
 /// For each record (tag, index, generation): whether it names a view that
@@ -555,16 +613,16 @@ fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
         .collect()
 }
 
-/// The view recorded at `handle`, if one is (and its resource is alive).
-pub(crate) fn view(handle: u64) -> Option<View> {
+/// The view recorded at `handle`, if one is (and its resource is alive),
+/// pinned until the returned value is dropped.
+#[cfg(any(windows, test))]
+pub(crate) fn view(handle: u64) -> Option<ViewPin> {
     if handle == 0 {
         return None;
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (tag == VIEW_TAG && *current == generation).then(|| view.clone())
+    (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten()
 }
 
 /// A description of `N` words, if the title passes one.
@@ -884,9 +942,12 @@ pub(crate) mod tests {
         let at = |i: usize| heap.as_ptr() as u64 + 32 * i as u64;
         let (s0, s1, s2, s3) = (at(0), at(1), at(2), at(3));
         create_cbv(null, &[0x1000, 1, 256, 0], s0);
-        assert_eq!(view(s0), Some(View::Constant(0x1_0000_1000, 256)));
+        assert_eq!(
+            view(s0).as_deref(),
+            Some(View::Constant(0x1_0000_1000, 256)).as_ref()
+        );
         create_srv(null, null, std::ptr::null(), s1);
-        assert_eq!(view(s1), Some(View::Shader(0, None)));
+        assert_eq!(view(s1).as_deref(), Some(View::Shader(0, None)).as_ref());
         // The same view twice is one entry.
         create_srv(null, null, std::ptr::null(), s2);
         // SAFETY: both slots are in `heap`.
@@ -905,9 +966,9 @@ pub(crate) mod tests {
             src_n.as_ptr(),
             0,
         );
-        assert_eq!(view(s2), view(s0));
-        assert_eq!(view(s3), view(s1));
-        assert_eq!(view(at(0) + 8), None);
+        assert_eq!(view(s2).as_deref(), view(s0).as_deref());
+        assert_eq!(view(s3).as_deref(), view(s1).as_deref());
+        assert!(view(at(0) + 8).is_none());
         heap[0] = 0;
     }
 
@@ -920,14 +981,85 @@ pub(crate) mod tests {
         let (a, b) = (slots.as_ptr() as u64, slots.as_ptr() as u64 + 32);
         let resource = 0x7777_0000usize as This;
         create_srv(null, resource, std::ptr::null(), a);
-        assert_eq!(view(a), Some(View::Shader(0x7777_0000, None)));
+        assert_eq!(
+            view(a).as_deref(),
+            Some(View::Shader(0x7777_0000, None)).as_ref()
+        );
         forget(0x7777_0000);
-        assert_eq!(view(a), None, "stale after release");
+        assert!(view(a).is_none(), "stale after release");
         create_srv(null, resource, std::ptr::null(), b);
-        assert_eq!(view(b), Some(View::Shader(0x7777_0000, None)));
+        assert_eq!(
+            view(b).as_deref(),
+            Some(View::Shader(0x7777_0000, None)).as_ref()
+        );
         // SAFETY: both slots are in `slots`.
         let (old, new) = unsafe { (*(a as *const [u32; 3]), *(b as *const [u32; 3])) };
         assert_ne!(old, new, "a new generation");
+    }
+
+    /// A final resource release invalidates its views immediately, but waits
+    /// for users holding their raw resource addresses before freeing them.
+    #[test]
+    fn resource_release_waits_for_pinned_views() {
+        let null = std::ptr::null();
+        let slots = [0u64; 2 * 4];
+        let at = slots.as_ptr() as u64;
+        let resource = 0xde5c_7100usize;
+        create_srv(null, resource as This, std::ptr::null(), at);
+        // SAFETY: the first record in `slots`.
+        let [_, i, generation] = unsafe { (at as *const [u32; 3]).read_unaligned() };
+        let first = view(at).expect("a current view");
+        let second = view(at).expect("the same current view again");
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            forget(resource);
+            done_tx.send(()).unwrap();
+        });
+        assert!(
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok()
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+            if views.list[i as usize].1 != generation {
+                break;
+            }
+            drop(views);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "release did not invalidate the view"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            matches!(
+                done_rx.recv_timeout(std::time::Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "resource release must wait for both view pins"
+        );
+
+        drop(first);
+        assert!(
+            matches!(
+                done_rx.recv_timeout(std::time::Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "the second view pin still holds the resource"
+        );
+        drop(second);
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok()
+        );
+        assert!(view(at).is_none(), "stale after the pinned use and release");
     }
 
     /// A record the title copies into its shader-visible heap as bytes (no
