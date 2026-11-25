@@ -463,6 +463,10 @@ pub fn emit_with(
     for e in interpolated {
         e.interp = match (e.kind, e.comp) {
             (3, _) => 4,
+            // Direct console reads below select the exact sample/centroid
+            // mode. DXIL defaults index 0 to perspective and index 1 to affine.
+            (23, 9) if e.index == 1 => 4,
+            (23, 9) => 2,
             // Constant, as DXC declares it (the AMD compiler crashed on a
             // front face without a mode).
             (13, _) => 1,
@@ -604,6 +608,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             68 => 18,
             69 => 20,
             70 => 15,
+            23 => 23, // barycentrics
             25 => 30, // cull primitive
             _ => {
                 return Err(ShaderError::Unsupported {
@@ -810,37 +815,127 @@ mod tests {
             let st = structure::structure(&p).unwrap();
             let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
             let io = io::raise(&p, &native).unwrap();
-            let shader = emit(&c, &native, &p, &st, &io, &res);
-            if matches!(case, Complete | NonzeroBase) {
-                let shader = shader.unwrap();
-                assert!(
-                    Container::parse(&shader.dxil)
-                        .unwrap()
-                        .part(FourCC::DXIL)
-                        .is_some()
-                );
-                #[cfg(windows)]
-                if let Ok(mut validator) =
-                    validator::Validator::load(validator::Validator::default_path().as_deref())
-                {
-                    let mut dxil = shader.dxil;
-                    validator.validate(&mut dxil).unwrap();
-                    eprintln!("synthetic {case:?} SDK valid bytes={}", dxil.len());
-                }
-            } else {
-                eprintln!("synthetic {case:?} {:?}", shader.as_ref().err());
-                assert!(
-                    matches!(
-                        shader,
-                        Err(ShaderError::Unsupported {
-                            what: "barycentrics read directly",
-                            ..
-                        })
-                    ),
-                    "{case:?}"
-                );
+            let shader = emit(&c, &native, &p, &st, &io, &res).unwrap_or_else(|e| {
+                panic!("{case:?}: direct perspective-center inputs should lower: {e}")
+            });
+            let host = Container::parse(&shader.dxil).unwrap();
+            assert!(host.part(FourCC::DXIL).is_some());
+            #[cfg(windows)]
+            if let Ok(mut validator) =
+                validator::Validator::load(validator::Validator::default_path().as_deref())
+            {
+                let mut dxil = shader.dxil;
+                validator.validate(&mut dxil).unwrap();
+                eprintln!("synthetic {case:?} SDK valid bytes={}", dxil.len());
             }
         }
+    }
+
+    #[test]
+    fn direct_barycentrics_emit_supported_dxil_inputs() {
+        // One GFX10 I or J VGPR moved to MRT0.x. `input_addr` has exactly
+        // one enabled barycentric pair, so v0/v1 are its I/J values.
+        let isg1 = rows(&[], true);
+        let osg1 = rows(&[("SV_Target", 16, false)], false);
+        let cases = [
+            (0, 0), // perspective sample
+            (1, 0), // perspective center
+            (2, 0), // perspective centroid
+            (4, 1), // affine sample
+            (5, 1), // affine center
+            (6, 1), // affine centroid
+        ];
+        for (bit, semantic_index) in cases {
+            for (reg, col) in [(0, 1), (1, 2)] {
+                let words = [
+                    0x7E06_0300 | reg, // v_mov_b32 v3, v0/v1
+                    0xF800_1801,
+                    3, // exp mrt0.x done vm
+                    0xBF81_0000,
+                ];
+                let out = emit_pixel(&words, vec![], 1 << bit, &isg1, &osg1).unwrap();
+                let host = Container::parse(&out.dxil).unwrap();
+                let signature = host.part(FourCC::ISG1).unwrap().data;
+                let read_u32 = |at| u32::from_le_bytes(signature[at..at + 4].try_into().unwrap());
+                assert_eq!(read_u32(0), 1, "bit {bit}, VGPR {reg}");
+                assert_eq!(read_u32(8 + 8), semantic_index, "semantic index");
+                assert_eq!(read_u32(8 + 12), 23, "D3D_NAME_BARYCENTRICS");
+                assert_eq!(read_u32(8 + 16), 3, "float32 component type");
+                assert_eq!(read_u32(8 + 20), u32::MAX, "unallocated signature row");
+                assert_eq!(signature[8 + 24], 0b111, "three barycentric weights");
+                assert_eq!(signature[8 + 25], 1 << col, "I/J component selection");
+                let name_at = read_u32(8 + 4) as usize;
+                assert_eq!(
+                    signature[name_at..]
+                        .split(|&byte| byte == 0)
+                        .next()
+                        .unwrap(),
+                    b"SV_Barycentrics"
+                );
+                let features =
+                    u64::from_le_bytes(host.part(FourCC::SFI0).unwrap().data.try_into().unwrap());
+                assert_ne!(features & (1 << 22), 0, "Barycentrics feature bit");
+                let psv = host.part(FourCC::PSV0).unwrap().data;
+                let sample_mode = bit == 0 || bit == 4;
+                assert_eq!(psv[5], u8::from(sample_mode), "sample frequency");
+            }
+        }
+    }
+
+    #[test]
+    fn barycentric_system_value_round_trips_without_a_register_row() {
+        let input = SigElement {
+            name: "SV_Barycentrics".into(),
+            index: 1,
+            kind: 23,
+            comp: 9,
+            interp: 4,
+            row: None,
+            col: 0,
+            cols: 3,
+            usage: 0b110,
+            half: false,
+        };
+        let bytes = container::signature(&[input], true);
+        let parsed = super::signature(&bytes).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "SV_Barycentrics");
+        assert_eq!(parsed[0].index, 1);
+        assert_eq!(parsed[0].kind, 23);
+        assert_eq!(parsed[0].comp, 9);
+        assert_eq!(parsed[0].row, None);
+        assert_eq!(parsed[0].cols, 3);
+        assert_eq!(parsed[0].usage, 0);
+    }
+
+    #[test]
+    fn direct_barycentric_reads_keep_unrepresentable_modes_unsupported() {
+        let isg1 = rows(&[], true);
+        let osg1 = rows(&[("SV_Target", 16, false)], false);
+        let words = [
+            0x7E06_0300u32, // v_mov_b32 v3, v0
+            0xF800_1801,
+            3, // exp mrt0.x done vm
+            0xBF81_0000,
+        ];
+        let pull_model = emit_pixel(&words, vec![], 1 << 3, &isg1, &osg1).unwrap_err();
+        assert!(
+            pull_model
+                .to_string()
+                .contains("barycentrics read directly")
+        );
+
+        // Two perspective locations cannot share DXIL's single semantic 0.
+        let two_locations = [
+            0x7E08_0300u32, // v_mov_b32 v4, v0 (sample I)
+            0x7E0A_0302,    // v_mov_b32 v5, v2 (center I)
+            0xF800_1801,
+            5, // exp mrt0.x done vm
+            0xBF81_0000,
+        ];
+        let conflict =
+            emit_pixel(&two_locations, vec![], (1 << 0) | (1 << 1), &isg1, &osg1).unwrap_err();
+        assert!(conflict.to_string().contains("barycentrics read directly"));
     }
 
     /// A pixel shader writing SV_StencilRef (channel y of `exp mrtz`).
