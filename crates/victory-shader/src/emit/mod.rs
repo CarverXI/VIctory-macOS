@@ -768,7 +768,10 @@ mod tests {
 
         // A two-block do-while loop writes v[M0] from v2, then exports v1.
         // On the first two passes M0 selects v0 and v1 respectively. Both
-        // registers initially contain raw perspective-center barycentrics.
+        // registers initially contain raw perspective pull-model values, which
+        // have no direct translation (the direct modes now do), so a loop
+        // wrongly accepted shows as a successful lowering and a loop whose
+        // output still reads the input stays unsupported.
         let words = |case| {
             let init = match case {
                 WrongStart => 0xbe80_0382,   // s_mov_b32 s0, 2
@@ -875,7 +878,7 @@ mod tests {
                 used: vec![],
                 io: StageIo::Ps {
                     inputs: vec![],
-                    input_addr: 2,
+                    input_addr: 1 << 3,
                     db_shader_control: 0,
                     patches: vec![],
                 },
@@ -885,18 +888,35 @@ mod tests {
             let st = structure::structure(&p).unwrap();
             let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
             let io = io::raise(&p, &native).unwrap();
-            let shader = emit(&c, &native, &p, &st, &io, &res).unwrap_or_else(|e| {
-                panic!("{case:?}: direct perspective-center inputs should lower: {e}")
-            });
-            let host = Container::parse(&shader.dxil).unwrap();
-            assert!(host.part(FourCC::DXIL).is_some());
-            #[cfg(windows)]
-            if let Ok(mut validator) =
-                validator::Validator::load(validator::Validator::default_path().as_deref())
-            {
-                let mut dxil = shader.dxil;
-                validator.validate(&mut dxil).unwrap();
-                eprintln!("synthetic {case:?} SDK valid bytes={}", dxil.len());
+            let shader = emit(&c, &native, &p, &st, &io, &res);
+            if matches!(case, Complete | NonzeroBase) {
+                let shader = shader.unwrap();
+                assert!(
+                    Container::parse(&shader.dxil)
+                        .unwrap()
+                        .part(FourCC::DXIL)
+                        .is_some()
+                );
+                #[cfg(windows)]
+                if let Ok(mut validator) =
+                    validator::Validator::load(validator::Validator::default_path().as_deref())
+                {
+                    let mut dxil = shader.dxil;
+                    validator.validate(&mut dxil).unwrap();
+                    eprintln!("synthetic {case:?} SDK valid bytes={}", dxil.len());
+                }
+            } else {
+                eprintln!("synthetic {case:?} {:?}", shader.as_ref().err());
+                assert!(
+                    matches!(
+                        shader,
+                        Err(ShaderError::Unsupported {
+                            what: "barycentrics read directly",
+                            ..
+                        })
+                    ),
+                    "{case:?}"
+                );
             }
         }
     }
