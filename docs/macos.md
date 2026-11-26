@@ -194,6 +194,11 @@ On an M1 Max with CrossOver Wine 11.17 and D3DMetal 4.0 beta 3, a reserved buffe
 
 Run the probe under the D3DMetal Wine runner with `tools/macos/test-wine.sh -p victory-gpu --lib inplace_probe_6_remap_cpu_visible_tiles -- --ignored --test-threads=1`.
 
+## Plain 256-bit stores into protected pages stop Rosetta too
+
+The masked-store patch is not enough on its own once fault tracking is on. Measured under CrossOver Wine on an M5 Max (macOS 26): a plain `vmovups`, `vmovdqu` or `vmovaps` of 32 bytes that begins in a writable page and faults in the next one stops Rosetta with the same "unexpectedly need to EmulateForward on a synchronous exception", before any handler runs. The same store wholly inside one page resumes. 128-bit stores, `vextractf128` to memory and smaller stores resume in every layout, and an AVX masked store of 128 bits stops it like one of 256. Series 1.0.2.1 has 119,296 plain 256-bit stores; #144 hit eight of them, which `VICTORY_PATCH_MASKED` now lists by hand.
+
+`cargo xtask wide-stores <image> > wide-sites.txt` lists all of them from the mapped title image in the cache (`<cache_dir>/images/victory-image-<hash>.dll`) with `llvm-objdump`, in about two minutes, as offsets and lengths only. With `VICTORY_PATCH_WIDE=<list>`, `victory-loader/src/wide.rs` turns each into a jump to a trampoline that writes the low half with the same store at 128 bits and the high half with `vextractf128 [m+16], ymm, 1`. A store of four bytes has no room for the jump: its site takes in the instructions next to it that can be moved (copied, RIP-relative ones with their displacement redone, conditional jumps re-encoded), never across a branch target. For 1.0.2.1 that is 117,413 sites, with 35 four-byte stores left that have nothing movable beside them. Every site's bytes are checked before it is patched; one that does not match is left alone and counted.
 ## Mesh pipelines over 32 KiB hang the queue
 
 On an M5 Max with D3DMetal 4.0 beta 3 the world-entry hang of #172 still happens on current main: a submission that holds the title's indirect mesh draws never completes ("still waiting for the host GPU" without end), right after the "Vice City, two years ago" card. Linking mesh and pixel outputs (#161) was off unless `VICTORY_LINK_MESH_OUTPUTS` was set, and nothing refused a pipeline still over the limit, so the oversized pipelines were made.
@@ -249,6 +254,7 @@ None of these changes the default. Each is read from the environment when the ga
 | `VICTORY_SPILL_SHADERS=1` | Keeps shader containers on disk until they are translated. The title passes tens of thousands of containers and draws with a few hundred, and holding them all took about 700 MB of an 8 GB Mac (#135). |
 | `VICTORY_READ_STATS=1` | Logs the requests and bytes read from each file, every 30 seconds, for the 30 most read. It shows which files a slow share serves most, so you can copy those to fast local storage. |
 | `VICTORY_GPU_BUDGET_MB=<MB>` | Sets the budget that host textures are kept under, in place of the device's. |
+| `VICTORY_PATCH_WIDE=<list>` | Splits the 256-bit stores listed by `cargo xtask wide-stores` into 128-bit halves, so fault tracking does not stop Rosetta on them (see above). |
 | `VICTORY_MESH_OVER_LIMIT=1` | Makes mesh pipelines whose outputs are over Metal's 32 KiB anyway (refused under Wine by default, as they hang the queue; see above). |
 | `VICTORY_OUTPUT=<W>x<H>` | Sets the title's output size, one of its own modes: 1280x720, 1664x936, 1920x1080, 2560x1440 or 3840x2160. It patches the title's code at load, only where the bytes match build 1.0.2.1, and logs `resolution: ... Done` for each site. On a 16 GB M4 (Series X), 1280x720 brought the GPU time of a world frame from about 8.4 s to 0.86 s. Ported from avatarmanz/VIctory-7900XTX. |
 | `VICTORY_RENDER_SCALE=<s>` | 0.5 to 1.0: the title's own upscaler's render scale (2/3 by default, Series X). Not yet tested on a Mac. |
