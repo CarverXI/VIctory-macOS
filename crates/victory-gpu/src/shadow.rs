@@ -1642,7 +1642,10 @@ pub(crate) mod tests {
             title(PAGE + 40).write_volatile(0x11);
             title(2 * PAGE + 50).write_volatile(0x22);
         }
-        // The shaders marked pages 0 and 1.
+        // The shaders marked pages 0 and 1. The bitmap is shared: held as a
+        // submission holds it, or another test's copy-back (or submission)
+        // can take these bits and put the pages back after the reads below.
+        let quiet = host().and_then(|h| h.quiet());
         let bits = b.data as *mut u32;
         for n in [base, base + 1] {
             // SAFETY: a dword of the mapped bitmap.
@@ -1657,6 +1660,7 @@ pub(crate) mod tests {
         // SAFETY: dwords of the mapped bitmap.
         let left: u32 = (base / 32..=(base + 1) / 32).map(|w| unsafe { *bits.add(w) }).fold(0, |a, w| a | w);
         assert_eq!(left, 0, "bits cleared");
+        drop(quiet);
         assert_eq!(copy.copy_back(p, len), 0, "nothing kept to compare");
         unregister(p, p as u64);
     }
@@ -1679,6 +1683,8 @@ pub(crate) mod tests {
         copy.write_host((p + 10) as u64, &[0xaa]);
         copy.write_host((p + PAGE + 10) as u64, &[0xbb]);
         // Page 0 marked by another shader, page 1 by one using title memory.
+        // Held as a submission holds the bitmaps (as in the test above).
+        let quiet = host().and_then(|h| h.quiet());
         for (b, n) in [(others, base), (memory, base + 1)] {
             // SAFETY: a dword of the mapped bitmap.
             unsafe { *(b.data as *mut u32).add(n / 32) |= 1 << (n % 32) };
@@ -1689,6 +1695,7 @@ pub(crate) mod tests {
         assert_eq!((read(10), read(PAGE + 10)), (0xaa, 0), "page 1 held back");
         // SAFETY: a dword of the mapped bitmap.
         assert_eq!(unsafe { *(memory.data as *const u32).add((base + 1) / 32) } & 1 << ((base + 1) % 32), 0, "cleared");
+        drop(quiet);
         unregister(p, p as u64);
     }
 
