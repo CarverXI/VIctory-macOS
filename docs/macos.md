@@ -173,3 +173,11 @@ Host textures fed from title memory are given up when the title has not used the
 
 `VICTORY_GPU_BUDGET_MB=<MB>` sets the budget the pass keeps host textures under, in place of the device's. A diagnostics build logs `host textures given up: N (M MB); made again after being given up: ...` with the statistics, so a run shows whether the pass gives textures up and whether it gives up ones still in use.
 
+## Metal ends long draws, and can stop the queue
+
+On macOS 27.0.1 (M5 Pro) with D3DMetal 4.0 beta 3, a draw whose every pixel runs long is ended about 50 ms in. D3DMetal logs `Caused GPU Hang Error (00000003:kIOGPUCommandBufferCallbackErrorHang)`, and the draw writes no pixels. The fence still completes, and `GetDeviceRemovedReason` still returns `S_OK`. The time is per pixel, not per draw. A 512x256 draw of 700 ms ran whole, and so did a 4096x256 draw of 2 s, while a 512x256 draw of 1 s was ended. A compute dispatch was never ended, even one of 29 s.
+
+After its second end, a queue ignores everything submitted to it, presents included. That held in all 7 runs on that Mac, and a first end never did it. D3DMetal logs `Ignored (for causing prior/excessive GPU errors) (00000004:kIOGPUCommandBufferCallbackErrorSubmissionsIgnored)`. Its fence still completes, so a run carries on with nothing drawn and the window frozen. A new queue on the same device runs work again, and so does a new swap chain for the same window on the new queue. cocobailey's run in #50 shows the same pair, and VIctory logged neither.
+
+So every submission now ends with a small list that copies the submission's number into read-back memory (`Mark` in `victory-gpu/src/host.rs`). `WriteBufferImmediate` writes nothing under D3DMetal, so it is a copy. When a submission did not run as far as its mark, it was ended, and what it drew is missing. VIctory logs that, then submits the mark alone. If that does not run either, a new queue replaces the old one, and the next present makes its swap chain on it. If the new queue does not run work either, the run ends with a host GPU failure. `work_goes_on_after_macos_stops_the_queue` (ignored, run under Wine on a Mac) shows the whole sequence. Two draws of about 4 s were ended, the second left its queue ignoring work, and a draw on the new queue ran whole.
+
