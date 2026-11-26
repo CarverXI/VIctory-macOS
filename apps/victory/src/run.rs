@@ -92,10 +92,19 @@ pub fn run(
     );
     // The file's bytes (the exe's size, 114 MB) are kept only to patch the
     // masked stores after the mapping.
-    let patching = victory_loader::masked::choice(
-        std::env::var("VICTORY_PATCH_MASKED").ok(),
-        victory_gpu::stores_need_patching(),
-    );
+    let needs_patch = victory_gpu::stores_need_patching();
+    let mut requested = std::env::var("VICTORY_PATCH_MASKED").ok();
+    // Rosetta can also fault midway through plain 256-bit vector stores in
+    // a few loops (#144). Their offsets are specific to Series 1.0.2.1, so
+    // they are added here only for that build, and an explicit
+    // `VICTORY_PATCH_MASKED` always wins.
+    if needs_patch
+        && requested.is_none()
+        && hash.as_str() == "b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93"
+    {
+        requested = Some("all,1e09b31,1e09b37,259509f,25950a5,1e759f0,1e759f7,1e759fe,1e75a05".into());
+    }
+    let patching = victory_loader::masked::choice(requested, needs_patch);
     let original = patching.is_some().then_some(original);
 
     let images = cfg.cache_subdir("images")?;
