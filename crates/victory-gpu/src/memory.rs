@@ -501,7 +501,7 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
     // without touching them (the table names every copy, ~4,700 in the world).
     for l in layout.iter() {
         for (c, bit) in l.copies.iter().zip(&l.bits) {
-            if !crate::watch::clean_bit(*bit) {
+            if !c.clean() && !crate::watch::clean_bit(*bit) {
                 let (start, len) = c.range();
                 add(c, start as usize, len as usize);
             }

@@ -108,6 +108,9 @@ pub(crate) struct Shadow {
     /// goes.
     base: u64,
     slice: Option<Slice>,
+    /// True when the title's virtual range `[start, start + len)` is
+    /// `mach_vm_remap`-aliased onto `buffer`'s physical pages (zero-copy).
+    aliased: bool,
 }
 
 /// A 16-byte-element host copy of a three-channel 32-bit buffer view. D3DMetal
@@ -365,6 +368,14 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        if self.aliased {
+            if self.has_widened.load(Ordering::Acquire) {
+                let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
+                self.refresh_widened(from, to);
+            }
+            crate::watch::notify_written(from, to - from);
+            return 0;
+        }
         let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
         // The normal shadow holds the GPU's bytes even when title memory
         // already matches or cannot be written; widened views still need them.
@@ -432,11 +443,50 @@ impl Shadow {
             has_widened: AtomicBool::new(false),
             base: slice.map_or(0, |s| s.offset),
             slice,
+            aliased: false,
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
         }
         shadow
+    }
+
+    /// A zero-copy shadow whose title range `[start, start + len)` shares
+    /// physical pages with `buffer` (`mach_vm_remap`).
+    pub(crate) fn new_aliased(
+        buffer: ID3D12Resource,
+        data: *mut u8,
+        gpu: u64,
+        start: u64,
+        len: u64,
+    ) -> Arc<Shadow> {
+        let marks = marks().take(pages(start, len));
+        let shadow = Arc::new(Shadow {
+            buffer,
+            data,
+            gpu,
+            start,
+            len,
+            tracked: None,
+            pending: Mutex::default(),
+            before: Mutex::default(),
+            marks,
+            widened: Mutex::default(),
+            widened_source: Mutex::default(),
+            has_widened: AtomicBool::new(false),
+            base: 0,
+            slice: None,
+            aliased: true,
+        });
+        if let Some(base) = marks {
+            self::marks().owners.insert(base, Arc::downgrade(&shadow));
+        }
+        shadow
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_aliased(&self) -> bool {
+        self.aliased
     }
 
     /// The view-mark entry (`victory_shader::emit`, "Write marks") of a
@@ -492,6 +542,9 @@ impl Shadow {
     /// a title write there before the copy-back keeps the page's bytes from
     /// before it ([`crate::watch::Tracked::arm`]).
     pub(crate) fn writing(&self, address: usize, len: usize, marked: bool) {
+        if self.aliased {
+            return;
+        }
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -575,6 +628,18 @@ impl Shadow {
     }
 
     fn copy_back_or_not(&self, address: usize, len: usize, back: bool) -> usize {
+        if self.aliased {
+            let (from, to) = self.inside(address, len);
+            if from < to {
+                let start = self.start as usize;
+                if self.has_widened.load(Ordering::Acquire) {
+                    let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
+                    self.refresh_widened(start + from, start + to);
+                }
+                crate::watch::notify_written(start + from, to - from);
+            }
+            return 0;
+        }
         let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (segments, compared) = &mut *snapshot;
@@ -667,6 +732,35 @@ impl Shadow {
     // the heap's views no list declared) keeps the title's bytes, losing
     // the shaders' there (counted).
     pub(crate) fn copy_back_marked(&self, pages: &[usize]) -> usize {
+        if self.aliased {
+            let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+            let mut run: Option<(usize, usize)> = None;
+            let flush = |from: usize, to: usize| {
+                if self.has_widened.load(Ordering::Acquire) {
+                    let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
+                    self.refresh_widened(from, to);
+                }
+                crate::watch::notify_written(from, to - from);
+            };
+            for &page in pages {
+                let (from, to) = (page.max(start), (page + PAGE).min(end));
+                if from >= to {
+                    continue;
+                }
+                match run {
+                    Some((r_from, r_to)) if r_to == from => run = Some((r_from, to)),
+                    Some((r_from, r_to)) => {
+                        flush(r_from, r_to);
+                        run = Some((from, to));
+                    }
+                    None => run = Some((from, to)),
+                }
+            }
+            if let Some((from, to)) = run {
+                flush(from, to);
+            }
+            return 0;
+        }
         let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
         let Some(t) = &self.tracked else {
             return 0;
@@ -751,6 +845,9 @@ impl Shadow {
     /// Whether the title wrote none of the copy's memory since the copy took
     /// it (tracked memory only): [`Shadow::update`] would copy nothing.
     pub(crate) fn clean(&self) -> bool {
+        if self.aliased {
+            return !self.has_widened.load(Ordering::Acquire);
+        }
         self.tracked.as_ref().is_some_and(crate::watch::Tracked::clean)
     }
 
@@ -764,6 +861,17 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        if self.aliased {
+            if self.has_widened.load(Ordering::Acquire) {
+                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+                let (from, to) = (address.max(start), address.saturating_add(len).min(end));
+                if from < to {
+                    let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
+                    self.refresh_widened(from, to);
+                }
+            }
+            return 0;
+        }
         let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
         if self.clean() {
             return 0;
@@ -1296,10 +1404,68 @@ fn enclosing(map: &BTreeMap<(u64, usize), Entry>, span: u64, address: u64, end: 
         .map(|(k, _)| *k)
 }
 
+/// Zero-copy title regions aliased onto host buffers (`crate::alias`), by start address.
+static ALIASED: RwLock<BTreeMap<u64, Arc<Shadow>>> = RwLock::new(BTreeMap::new());
+static ALIASED_SPAN: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn has_aliased_overlap(start: u64, end: u64) -> bool {
+    let map = ALIASED.read().unwrap_or_else(|e| e.into_inner());
+    let span = ALIASED_SPAN.load(Ordering::Relaxed);
+    let lowest = start.saturating_sub(span);
+    if map
+        .range(lowest..=start)
+        .rev()
+        .any(|(&s, sh)| s + sh.len > start)
+    {
+        return true;
+    }
+    map.range(start..end).next().is_some()
+}
+
+pub(crate) fn register_aliased(shadow: Arc<Shadow>) {
+    ALIASED_SPAN.fetch_max(shadow.len, Ordering::Relaxed);
+    ALIASED
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(shadow.start, shadow);
+    changed();
+}
+
+pub(crate) fn unregister_aliased(start: u64) -> bool {
+    let removed = ALIASED
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&start)
+        .is_some();
+    if removed {
+        changed();
+    }
+    removed
+}
+
+fn find_aliased(address: u64, end: u64) -> Option<Arc<Shadow>> {
+    let map = ALIASED.read().unwrap_or_else(|e| e.into_inner());
+    if map.is_empty() {
+        return None;
+    }
+    let span = ALIASED_SPAN.load(Ordering::Relaxed);
+    let lowest = end.saturating_sub(span);
+    if lowest > address {
+        return None;
+    }
+    map.range(lowest..=address)
+        .rev()
+        .find(|(_, s)| s.start + s.len >= end)
+        .map(|(_, s)| s.clone())
+}
+
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
+    if let Some(shadow) = find_aliased(address, end) {
+        return Some(shadow);
+    }
     {
         let map = buffers_read();
         let Some(key) = enclosing(&map, MAX_SPAN.load(Ordering::Relaxed), address, end) else {
@@ -1597,10 +1763,15 @@ impl Arena {
     }
 }
 
-/// Every host copy of title memory made so far (buffers and windows).
+/// Every host copy of title memory made so far (buffers, aliases, and windows).
 pub(crate) fn all() -> Vec<Arc<Shadow>> {
-    let mut all: Vec<Arc<Shadow>> =
-        buffers_read().values().filter_map(|e| e.shadow.clone()).collect();
+    let mut all: Vec<Arc<Shadow>> = ALIASED
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .cloned()
+        .collect();
+    all.extend(buffers_read().values().filter_map(|e| e.shadow.clone()));
     all.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
     all
 }
@@ -1608,10 +1779,17 @@ pub(crate) fn all() -> Vec<Arc<Shadow>> {
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers_read()
+    let mut all: Vec<(u64, u64, u64)> = ALIASED
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
         .values()
-        .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
+        .map(|s| (s.gpu, s.start, s.len))
         .collect();
+    all.extend(
+        buffers_read()
+            .values()
+            .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len))),
+    );
     all.extend(
         LOOSE
             .lock()

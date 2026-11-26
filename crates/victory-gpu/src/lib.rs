@@ -17,6 +17,8 @@
 //! `present` (swap chain).
 
 #[cfg(windows)]
+mod alias;
+#[cfg(windows)]
 mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
@@ -83,6 +85,8 @@ mod inplace_probe;
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use copystat::CountingAlloc;
+#[cfg(windows)]
+pub use alias::{alias_region, enabled as alias_buffers, unalias_region};
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
