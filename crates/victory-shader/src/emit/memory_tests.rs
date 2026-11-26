@@ -771,6 +771,12 @@ fn typed_store_marks_use_the_element_stride_at_page_boundaries() {
         };
         let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
         for &(name, format, stride) in &cases {
+            // WARP on some hosts loses the device on RGB32 typed views, so
+            // it runs only the formats it says it can load and store.
+            if warp && !host.typed_buffer_access(format, warp) {
+                eprintln!("{label} {name}: no typed UAV load and store; skipped");
+                continue;
+            }
             let elements = 65_536 / stride;
             let index = elements - 1;
             // Put the element's last byte at 65,535. 65 KiB is not a
