@@ -3283,12 +3283,34 @@ impl<'a> Lower<'a> {
         )
     }
 
-    /// Whether `src` is active under the current `EXEC` mask (`guard` for
-    /// straight-line narrowing, plus the host wave's live lanes for
-    /// branch-structurised control flow). Returns `None` for unguarded pixel
-    /// quad ops so WQM helper lanes remain active (`waveActiveBallot` excludes
+    /// `inst`'s `EXEC` as both dwords of a ballot taken in the block that
+    /// writes it (see [`MaskData`]), where every lane of the wave still runs.
+    /// A ballot inside a structurised branch is not exact under D3DMetal: it
+    /// counts lanes that never entered the branch, even of a condition that
+    /// only they fail (the compiler folds the branch condition to `true`
+    /// inside it).
+    fn exec_ballot(&mut self, inst: &Inst) -> Option<(V, V)> {
+        let lo = self.mask_dword(inst.read(Reg::S(EXEC))?).ok()?;
+        let hi = match inst.read(Reg::S(EXEC + 1)) {
+            Some(h) => self.mask_dword(h).ok()?,
+            None => self.s.m.i32(0),
+        };
+        Some((lo, hi))
+    }
+
+    /// Whether `src` is active under `inst`'s `EXEC` mask: the bit of the
+    /// mask's ballot where it is written, else (`guard` for straight-line
+    /// narrowing, plus the host wave's live lanes for branch-structurised
+    /// control flow) a ballot here. Returns `None` for unguarded pixel quad
+    /// ops so WQM helper lanes remain active (`waveActiveBallot` excludes
     /// helper lanes in DXIL).
-    fn src_lane_active(&mut self, src: V, guard: Option<V>, mesh_quad: bool) -> Option<V> {
+    fn src_lane_active(
+        &mut self,
+        inst: &Inst,
+        src: V,
+        guard: Option<V>,
+        mesh_quad: bool,
+    ) -> Option<V> {
         let c = self.cur;
         if self.s.pixel {
             let g = guard?;
@@ -3296,6 +3318,13 @@ impl<'a> Lower<'a> {
             let active_i32 = self.s.m.select(c, g, one, zero);
             let picked = self.quad_pick(active_i32, src);
             return Some(self.s.m.cmp(c, pred::NE, picked, zero));
+        }
+        if !mesh_quad
+            && self.console_lanes
+            && !self.halves
+            && let Some((lo, hi)) = self.exec_ballot(inst)
+        {
+            return Some(self.lane_bit_of(c, src, lo, hi));
         }
         let bit = guard.unwrap_or_else(|| self.s.m.bool(true));
         let i32t = self.s.t.i32;
@@ -3402,7 +3431,7 @@ impl<'a> Lower<'a> {
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
             let use_quad = mesh_quad || self.helpers_read(quad);
-            let src_ok = self.src_lane_active(src, guard, mesh_quad);
+            let src_ok = self.src_lane_active(inst, src, guard, mesh_quad);
             let mut r = if use_quad {
                 self.quad_pick(x, src)
             } else {
@@ -3444,16 +3473,26 @@ impl<'a> Lower<'a> {
                 within_half
             };
             let r = self.read_lane(x, lane);
-            let on = guard.unwrap_or_else(|| self.s.m.bool(true));
-            let i32t = self.s.t.i32;
-            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-            let ballot = self
-                .s
-                .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
-            let (lo, hi) = (
-                self.s.m.extract(c, ballot, 0),
-                self.s.m.extract(c, ballot, 1),
-            );
+            let exec = if self.console_lanes && !self.halves {
+                self.exec_ballot(inst)
+            } else {
+                None
+            };
+            let (lo, hi) = match exec {
+                Some(xy) => xy,
+                None => {
+                    let on = guard.unwrap_or_else(|| self.s.m.bool(true));
+                    let i32t = self.s.t.i32;
+                    let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                    let ballot = self
+                        .s
+                        .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+                    (
+                        self.s.m.extract(c, ballot, 0),
+                        self.s.m.extract(c, ballot, 1),
+                    )
+                }
+            };
             let running = self.lane_bit_of(c, lane, lo, hi);
             let z = k(self, 0);
             let r = self.s.m.select(c, running, r, z);
@@ -6343,7 +6382,7 @@ impl<'a> Lower<'a> {
         let src_active = if fi {
             None
         } else {
-            self.src_lane_active(src, guard, mesh_quad)
+            self.src_lane_active(inst, src, guard, mesh_quad)
         };
         let valid = match (inside, src_active) {
             (Some(in_b), Some(act)) => Some(self.s.m.bin(c, Bin::And, in_b, act)),
