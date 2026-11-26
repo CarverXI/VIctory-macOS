@@ -75,10 +75,13 @@ impl Scratch {
         let mut full = false;
         for &k in &self.order {
             let (start, len) = copies[k];
-            if len == 0 || start + len > 1 << 40 {
+            let Some(end) = start.checked_add(len) else {
+                continue;
+            };
+            if len == 0 || end > 1 << 40 {
                 continue;
             }
-            for page in start >> 16..=(start + len - 1) >> 16 {
+            for page in start >> 16..=(end - 1) >> 16 {
                 let l1 = (page >> 12) as usize;
                 if self.level1[l1] == 0 {
                     if out.blocks.len() > CAPACITY {
@@ -93,7 +96,7 @@ impl Scratch {
                 // Larger copies come first: a copy holding the whole page
                 // takes it from them; one holding part of it only takes
                 // it if free.
-                let whole = page << 16 >= start && (page + 1) << 16 <= start + len;
+                let whole = page << 16 >= start && (page + 1) << 16 <= end;
                 if whole || self.owner[entry].is_none() {
                     self.owner[entry] = Some((k, whole));
                 }
