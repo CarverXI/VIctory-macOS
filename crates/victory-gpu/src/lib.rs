@@ -20,7 +20,8 @@
 mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
+mod caption;
 #[cfg(windows)]
 mod composite;
 #[cfg(windows)]
@@ -43,6 +44,8 @@ mod host;
 #[cfg(windows)]
 mod indirect;
 pub mod list;
+#[cfg(all(windows, test))]
+mod list_bench;
 #[cfg(windows)]
 mod memory;
 pub mod object;
