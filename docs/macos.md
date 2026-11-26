@@ -163,3 +163,13 @@ With every masked store patched and fault tracking on, #144 then stopped on a pl
 
 Set `VICTORY_PRESENT_MAX=1280x720` to cap the host presentation pass and DXGI swap chain at 720p. Smaller pictures keep their native size. The cap preserves the picture’s aspect ratio and applies after the game’s rendering and upscaling.
 
+## Host textures on Macs with 8 or 16 GB
+
+Host textures fed from title memory are given up when the title has not used them for two minutes, or, past 90 % of the card's memory budget, least recently used first (`victory_gpu::resource::evict_unused`). On a Mac that budget does little, as measured under CrossOver 26.3's Wine with D3DMetal 4.0 beta 3 on an M5 Pro with 48 GB:
+
+- `QueryVideoMemoryInfo` gives a budget of about four fifths of the Mac's memory (40,201 MB of 51,540 MB), the same for local and non-local memory, and `D3D12_FEATURE_ARCHITECTURE` says the adapter is not UMA. Its use follows our textures, heaps and buffers exactly.
+- The title's own memory shares that memory but is not in the budget. On an 8 GB Mac the textures alone filled memory into swap long before 90 % of the budget (#135).
+- Memory freed through D3DMetal stays with the process. Released heaps, and released committed buffers, leave the process's physical footprint (`footprint -p`) where it was, 20 seconds later too, and `ID3D12Device::Evict` does not lower it. New resources reuse that memory first. So the process holds the most GPU memory it ever used, and textures help only if they are given up before that peak.
+
+`VICTORY_GPU_BUDGET_MB=<MB>` sets the budget the pass keeps host textures under, in place of the device's. A diagnostics build logs `host textures given up: N (M MB); made again after being given up: ...` with the statistics, so a run shows whether the pass gives textures up and whether it gives up ones still in use.
+
