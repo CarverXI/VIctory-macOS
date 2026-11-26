@@ -270,6 +270,61 @@ fn a_wave64_program_reading_lanes_declares_32_lane_waves_in_halves() {
     assert_eq!(lowered(&n32, true).expect("wave32").wave_size, Some(32));
 }
 
+#[test]
+fn a_lane_mask_fits_in_a_single_host_wave() {
+    let first_active_lane = [
+        PROLOGUE.as_slice(),
+        &[
+            0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+            0xBE8C_147E, // s_ff1_i32_b64 s12, exec
+            0x7E02_020C, // v_mov_b32 v1, s12
+        ],
+        &store(1, 0),
+        &[S_ENDPGM],
+    ]
+    .concat();
+    assert_eq!(refusal(&first_active_lane, 32, 0), "translated");
+    let why = refusal(&first_active_lane, 64, 0);
+    assert!(why.contains("a lane mask read as data (wave64 on a 32-lane host)"), "{why}");
+}
+
+#[test]
+fn an_active_reduction_fits_in_a_single_host_wave() {
+    let mut sum = PROLOGUE.to_vec();
+    sum.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7E06_0D00, // v_cvt_f32_u32 v3, v0
+        0xBE8C_25C1, // s_or_saveexec_b64 s[12:13], -1
+        0xD501_0001,
+        0x0032_0680, // v_cndmask_b32 v1, 0, v3, s[12:13]
+    ]);
+    for control in [0x161, 0x162, 0x164, 0x168] {
+        sum.extend([
+            0x0602_02FA,
+            0xFF00_0001 | control << 8, // v_add_f32 v1, v1, v1 row_xmask
+        ]);
+    }
+    sum.extend([
+        0xD778_0002,
+        0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+        0x0602_0302, // v_add_f32 v1, v2, v1
+        0xD760_000E,
+        0x0001_4101, // v_readlane_b32 s14, v1, 32
+        0x0602_020E, // v_add_f32 v1, s14, v1
+        0xD760_000F,
+        0x0001_0101, // v_readlane_b32 s15, v1, 0
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7E02_020F, // v_mov_b32 v1, s15
+    ]);
+    sum.extend(store(1, 0));
+    sum.push(S_ENDPGM);
+
+    let why = refusal(&sum, 64, 0);
+    assert!(why.contains("a wave reduction over both 32-lane halves"), "{why}");
+    let failed = differences(&sum, 32, 1, &[496.0_f32.to_bits(); 32]);
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
 /// Reads across the halves are refused where they are made, with a reason
 /// naming the host's waves; the same programs translate for 64-lane hosts.
 #[test]

@@ -19,9 +19,10 @@
 //!   row mask names (rows 2 and 3 are the upper half's) are decided by the
 //!   console lane ([`Lower::console_lane`]);
 //! * across halves, refused: ballots (a mask read as data holds the other
-//!   half's lanes), `v_readlane_b32` of a lane that may be in the other half
+//!   half's lanes unless the whole group fits one host wave),
+//!   `v_readlane_b32` of a lane that may be in the other half
 //!   (SGPR spills read back are not lane reads), and whole-wave reductions
-//!   and prefix sums;
+//!   (unless an active reduction fits one host wave) and prefix sums;
 //! * `v_readfirstlane_b32` reads the host wave's first lane, which in the
 //!   upper half is console lane 32 or later: kept for a value the same in
 //!   every lane of the console wave ([`lane_uniform`], what the compiler
