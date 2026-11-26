@@ -111,6 +111,11 @@ tools/macos/victory.sh run --execute <the game's executable>
 
 For now this gets as far as VIctory does on Windows, as the note at the top explains.
 
+Set `VICTORY_WINDOW_SECONDARY=1` to open the game window on the only non-primary
+display. This requires two extended displays. If VIctory cannot select a single
+secondary display, it leaves the game window hidden. `VICTORY_WINDOW_MAX=WIDTHxHEIGHT`
+can further limit the window size without changing the render target.
+
 ## Running the tests
 
 These commands are useful for anyone who works on the code. The first runs the tests natively on the Mac, and the second runs them as Windows programs on Wine with D3DMetal, which includes the GPU tests.
