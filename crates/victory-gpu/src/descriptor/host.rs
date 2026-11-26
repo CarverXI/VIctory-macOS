@@ -1001,8 +1001,8 @@ fn view_stride(view: &View) -> u32 {
 /// The view-stride table's format-kind bits of a buffer view: a typed view
 /// (no structure stride, not raw) of an integer format gets
 /// `VIEW_INTEGER`, a signed one also `VIEW_SIGNED`; anything else none.
-/// Translated shaders pass 16-bit typed data of such views as bits, not as
-/// halves (`victory_shader::emit`, "d16").
+/// Translated shaders select integer typed-buffer overloads for such views,
+/// and pass their 16-bit typed data as bits (`victory_shader::emit`, "d16").
 fn view_kind(view: &View) -> u32 {
     use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
     let (unordered, words): (bool, &[u32; 10]) = match view {
@@ -1858,6 +1858,8 @@ mod tests {
         // Format, dimension (buffer), first element, count, stride, counter, flags.
         let uav = |format, stride, flags| View::Unordered(0, 0, Some([format, 1, 0, 0, 64, stride, 0, 0, flags, 0]));
         assert_eq!(view_kind(&uav(12, 0, 0)), VIEW_INTEGER, "R16G16B16A16_UINT");
+        assert_eq!(view_kind(&uav(7, 0, 0)), VIEW_INTEGER, "R32G32B32_UINT");
+        assert_eq!(view_kind(&uav(8, 0, 0)), VIEW_INTEGER | VIEW_SIGNED, "R32G32B32_SINT");
         assert_eq!(view_kind(&uav(57, 0, 0)), VIEW_INTEGER, "R16_UINT");
         assert_eq!(view_kind(&uav(59, 0, 0)), VIEW_INTEGER | VIEW_SIGNED, "R16_SINT");
         assert_eq!(view_kind(&uav(64, 0, 0)), VIEW_INTEGER | VIEW_SIGNED, "R8_SINT");
