@@ -58,9 +58,11 @@
 //! * **Buffer views in the heap** are declared by how the shader reads
 //!   them: raw (ByteAddressBuffer) for dword loads and stores, atomics and
 //!   typed-format loads without an index; structured with the used-resource
-//!   entry's stride when indexed; typed with four 32-bit float channels for
-//!   `buffer_load_format_*` and `buffer_store_format_*`. The host's view at
-//!   that index must be of that kind and start at the console descriptor's
+//!   entry's stride when indexed; typed with four 32-bit channels for
+//!   `buffer_load_format_*` and `buffer_store_format_*`. A dynamic integer
+//!   view gets a second, integer-annotated handle and guarded `.i32` loads
+//!   and stores; float views keep the `.f32` path. The host's view at that
+//!   index must be of that kind and start at the console descriptor's
 //!   base address (raw: `R32_TYPELESS` with the raw flag), whatever kind the
 //!   title's view description says. Typed-format loads from heap
 //!   descriptors (1,024 world compute programs, ray-tracing material
@@ -228,6 +230,8 @@ mod shader;
 mod stride_tests;
 #[cfg(all(test, windows))]
 mod synthetic_tests;
+#[cfg(test)]
+mod typed_buffer_tests;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]

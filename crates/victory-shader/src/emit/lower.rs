@@ -31,6 +31,14 @@ enum Val {
     Missing(Why),
 }
 
+#[cfg(test)]
+pub(crate) struct TypedBufferCalls {
+    /// Blocks with `bufferLoad.f32` and `bufferLoad.i32` calls.
+    pub loads: [Vec<usize>; 2],
+    /// Blocks with `bufferStore.f32` and `bufferStore.i32` calls.
+    pub stores: [Vec<usize>; 2],
+}
+
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
     /// Bit n: immediate sampler n is a comparison sampler.
@@ -66,6 +74,9 @@ pub(crate) struct Lowered {
     /// Whether it declares rasterizer-ordered views.
     #[cfg(test)]
     pub rovs: bool,
+    /// Written typed-buffer calls, for structural tests of the dynamic path.
+    #[cfg(test)]
+    pub typed_buffer_calls: TypedBufferCalls,
 }
 
 pub(crate) struct Parts<'a> {
@@ -114,6 +125,11 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 }
 
 const TWO_PI: f32 = std::f32::consts::TAU;
+/// `dx.types.ResourceProperties`' second dword for a four-component typed
+/// handle: component type in byte 0 (`F32` = 9, `I32` = 4), component count in
+/// byte 1. UINT and SINT views both use the signless `.i32` DXIL overload.
+const TYPED_F32_PROPS: u32 = 9 | 4 << 8;
+const TYPED_I32_PROPS: u32 = 4 | 4 << 8;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
 
@@ -182,6 +198,8 @@ fn half_shift(width: u32) -> u32 {
 /// parameter and byte offset.
 type EntryAddress = (usize, u32);
 
+type HandleKey = (usize, Site, u8, bool, (u32, u32));
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -221,15 +239,15 @@ struct Lower<'a> {
     waterfall_compares: Set<Site>,
     waterfall_reads: Set<Value>,
     waterfall_loads: Set<Site>,
-    handles: Map<(usize, Site, u8, bool, u32), V>,
+    handles: Map<HandleKey, V>,
     /// Handles made in the entry block for descriptors at addresses the
     /// root parameters alone give (table and heap loads with no other
     /// term), by base value, byte offset, dword, offset register, sampler
     /// heap and properties ([`Lower::entry_address`]).
-    entry_handles: Map<(EntryAddress, u8, bool, u32), V>,
+    entry_handles: Map<(EntryAddress, u8, bool, (u32, u32)), V>,
     /// Handles of descriptors chosen by control flow, made in their join
     /// block, by the choice (its `Debug` text), sampler heap and properties.
-    join_handles: Map<(String, bool, u32), V>,
+    join_handles: Map<(String, bool, (u32, u32)), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: Map<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -1405,6 +1423,17 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             rovs: self.s.flags & flags::ROVS != 0,
+            #[cfg(test)]
+            typed_buffer_calls: TypedBufferCalls {
+                loads: [
+                    self.s.m.written_call_blocks("dx.op.bufferLoad.f32"),
+                    self.s.m.written_call_blocks("dx.op.bufferLoad.i32"),
+                ],
+                stores: [
+                    self.s.m.written_call_blocks("dx.op.bufferStore.f32"),
+                    self.s.m.written_call_blocks("dx.op.bufferStore.i32"),
+                ],
+            },
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -4642,6 +4671,68 @@ impl<'a> Lower<'a> {
         Some((int, signed))
     }
 
+    /// A 32-bit typed load through independently annotated float and integer
+    /// handles. The view's format is dynamic, so the overloads must be in
+    /// mutually exclusive branches: executing `bufferLoad.i32` on a float view
+    /// (or the reverse) is not a bitcast. Each result channel is an `i32` phi;
+    /// the float path bitcasts only after the float load has taken place.
+    fn typed_buffer_load(
+        &mut self,
+        float_h: V,
+        integer_h: V,
+        index: V,
+        integer: V,
+        count: u32,
+    ) -> Vec<V> {
+        let head = self.cur;
+        let (integer_block, float_block, join) = (
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+        );
+        self.s.m.terminate(head, Term::CondBr(integer, integer_block, float_block));
+        let iu = self.s.m.undef(self.s.t.i32);
+        let mut integer_values = Vec::new();
+        self.cur = integer_block;
+        let r = self.s.op(
+            integer_block,
+            "bufferLoad.i32",
+            Attr::ReadOnly,
+            self.s.t.res_ret_i32,
+            68,
+            &[integer_h, index, iu],
+        );
+        for ch in 0..count {
+            integer_values.push(self.s.m.extract(integer_block, r, ch));
+        }
+        self.s.m.terminate(integer_block, Term::Br(join));
+        let mut float_values = Vec::new();
+        self.cur = float_block;
+        let r = self.s.op(
+            float_block,
+            "bufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            68,
+            &[float_h, index, iu],
+        );
+        for ch in 0..count {
+            let x = self.s.m.extract(float_block, r, ch);
+            float_values.push(self.as_int(x));
+        }
+        self.s.m.terminate(float_block, Term::Br(join));
+        self.cur = join;
+        integer_values
+            .into_iter()
+            .zip(float_values)
+            .map(|(integer, float)| {
+                let phi = self.s.m.phi(join, self.s.t.i32);
+                self.s.m.set_phi(phi, vec![(integer, integer_block), (float, float_block)]);
+                phi
+            })
+            .collect()
+    }
+
     /// Title memory at a raw GPU address (decision 0005: the unified-memory
     /// item). Every access to an address the program computes goes through
     /// here: scalar and global loads, stores and atomics, the BVH node
@@ -5340,7 +5431,7 @@ impl<'a> Lower<'a> {
                 // compiler reloads one before every use rather than keep it
                 // (ActivateRays: 2,399 loads of one), and one handle made in
                 // the entry block serves them all.
-                let key = (address, *first, sampler, props.0);
+                let key = (address, *first, sampler, props);
                 if let Some(&h) = self.entry_handles.get(&key) {
                     return Ok(h);
                 }
@@ -5353,7 +5444,7 @@ impl<'a> Lower<'a> {
                 Ok(h)
             }
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                let key = (self.cur, *load, *first, sampler, props);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -5462,7 +5553,7 @@ impl<'a> Lower<'a> {
                 // One handle at the join for every access the choice reaches
                 // (each is in a block the join dominates).
                 let _ = site;
-                let key = (format!("{src:?}"), sampler, props.0);
+                let key = (format!("{src:?}"), sampler, props);
                 if let Some(&h) = self.join_handles.get(&key) {
                     return Ok(h);
                 }
@@ -9558,7 +9649,7 @@ impl<'a> Lower<'a> {
             let mut vals =
                 self.vgprs(inst, data.as_ref().ok_or("buffer store data")?, regs as u8)?;
             let typed_h = if typed {
-                Some(self.handle(site, src, false, (10 | u, 0x409))?)
+                Some(self.handle(site, src, false, (10 | u, TYPED_F32_PROPS))?)
             } else {
                 None
             };
@@ -9593,6 +9684,90 @@ impl<'a> Lower<'a> {
                     wide.push(w);
                 }
                 vals = wide;
+            }
+            if typed && !d16 {
+                // As for loads, a dynamic integer view gets a separately
+                // annotated handle and a mutually exclusive integer store.
+                if count != 4 {
+                    return Err("a typed buffer store of some channels or at an offset");
+                }
+                if *offen || *offset != 0 || matches!(off, V::Inst(_)) {
+                    return Err("a typed buffer store at an offset");
+                }
+                let h = typed_h.ok_or("a typed buffer store")?;
+                let element = index.unwrap_or(self.s.m.i32(0));
+                let (byte, bytes) = if self.x.view_marks {
+                    let at = self
+                        .s
+                        .view_index
+                        .get(&h)
+                        .copied()
+                        .ok_or("a typed buffer store")?;
+                    let stride = self.stride_at(at);
+                    (self.s.m.bin(self.cur, Bin::Mul, element, stride), stride)
+                } else {
+                    (element, self.s.m.i32(0))
+                };
+                let integer = self.integer_view(h).map(|(integer, _)| integer);
+                let integer_h = if integer.is_some() {
+                    Some(self.handle(site, src, false, (10 | u, TYPED_I32_PROPS))?)
+                } else {
+                    None
+                };
+                let outer = self.begin_guarded(guard);
+                self.mark_view_write(h, byte, bytes, None);
+                if let (Some(integer), Some(integer_h)) = (integer, integer_h) {
+                    let head = self.cur;
+                    let (integer_block, float_block, join) = (
+                        self.s.m.new_block(),
+                        self.s.m.new_block(),
+                        self.s.m.new_block(),
+                    );
+                    self.s.m.terminate(head, Term::CondBr(integer, integer_block, float_block));
+                    let iu = self.s.m.undef(self.s.t.i32);
+                    let mask = self.s.m.i8(0xF);
+                    self.cur = integer_block;
+                    let mut args = vec![integer_h, element, iu];
+                    args.extend_from_slice(&vals);
+                    args.push(mask);
+                    self.s.op(
+                        integer_block,
+                        "bufferStore.i32",
+                        Attr::NoUnwind,
+                        self.s.t.void,
+                        69,
+                        &args,
+                    );
+                    self.s.m.terminate(integer_block, Term::Br(join));
+                    self.cur = float_block;
+                    let mut args = vec![h, element, iu];
+                    args.extend(vals.iter().map(|&x| self.as_float(x)));
+                    args.push(mask);
+                    self.s.op(
+                        float_block,
+                        "bufferStore.f32",
+                        Attr::NoUnwind,
+                        self.s.t.void,
+                        69,
+                        &args,
+                    );
+                    self.s.m.terminate(float_block, Term::Br(join));
+                    self.cur = join;
+                } else {
+                    let mut args = vec![h, element, iu];
+                    args.extend(vals.iter().map(|&x| self.as_float(x)));
+                    args.push(self.s.m.i8(0xF));
+                    self.s.op(
+                        self.cur,
+                        "bufferStore.f32",
+                        Attr::NoUnwind,
+                        self.s.t.void,
+                        69,
+                        &args,
+                    );
+                }
+                self.end_guarded(outer, &[]);
+                return Ok(());
             }
             let mut args = Vec::new();
             // Where the write starts in the view, and how many bytes it may
@@ -9720,6 +9895,42 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), x, guard);
             return Ok(());
         }
+        if typed && !d16 {
+            if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
+                return Err("a typed buffer load at an offset");
+            }
+            if uav {
+                self.s.flags |= flags::TYPED_UAV_LOADS;
+            }
+            let h = self.handle(site, src, false, (10 | u, TYPED_F32_PROPS))?;
+            let index = index.unwrap_or(self.s.m.i32(0));
+            let xs = if let Some((integer, _)) = self.integer_view(h) {
+                let integer_h = self.handle(site, src, false, (10 | u, TYPED_I32_PROPS))?;
+                self.typed_buffer_load(h, integer_h, index, integer, count)
+            } else {
+                let r = self.s.op(
+                    self.cur,
+                    "bufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    68,
+                    &[h, index, iu],
+                );
+                (0..count)
+                    .map(|ch| {
+                        let x = self.s.m.extract(self.cur, r, ch);
+                        self.as_int(x)
+                    })
+                    .collect()
+            };
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
+            for (k, x) in xs.into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
         let mut typed_h = None;
         let r = if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
@@ -9728,7 +9939,7 @@ impl<'a> Lower<'a> {
             if uav {
                 self.s.flags |= flags::TYPED_UAV_LOADS;
             }
-            let h = self.handle(site, src, false, (10 | u, 0x409))?;
+            let h = self.handle(site, src, false, (10 | u, TYPED_F32_PROPS))?;
             typed_h = Some(h);
             let index = index.unwrap_or(self.s.m.i32(0));
             self.s.op(
@@ -9781,11 +9992,11 @@ impl<'a> Lower<'a> {
             // Two 16-bit channels per VGPR (an odd last high half 0): f16 for
             // float and normalized formats; for integer formats (the view's
             // kind, from the view-stride table) the integer's low 16 bits.
-            // shortcut: an integer view is read and written through the
-            // float-typed handle, so its channels' bits travel as the driver
-            // passes a mismatched component type (unchanged on the RX 6700
-            // XT and WARP, `stride_tests`); an integer-typed second handle
-            // for the slot would not rely on it.
+            // Unlike the 32-bit accesses above, `_d16` keeps the established
+            // widened-float path for narrow formats: an integer view is read
+            // and written through the float-typed handle, so its channels' bits
+            // travel as the driver passes a mismatched component type
+            // (unchanged on the RX 6700 XT and WARP, `stride_tests`).
             let integer = typed_h.and_then(|h| self.integer_view(h));
             let c = self.cur;
             let k16 = self.s.m.i32(16);
