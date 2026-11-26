@@ -705,6 +705,12 @@ impl State {
                 .flatten()
             {
                 list.defer_heap(&host.viewed);
+                for buffer in host.widened_buffers() {
+                    list.mark_widened_read(&buffer);
+                }
+                if writes {
+                    list.mark_widened_heap(&host.viewed);
+                }
             }
             crate::bindless::note_draw(writes);
         }
@@ -1936,6 +1942,12 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
         shadow.refresh(list, refresh_at, refresh_len);
         if uav {
             shadow.gpu_writes(list, address, len, marked);
+        } else if u.kind == ResourceType::Srv && crate::descriptor::host::three_channel_srv(view) {
+            for widened in
+                crate::shadow::widened_in(address as usize, (address + len) as usize)
+            {
+                list.mark_widened_read(&widened.buffer);
+            }
         }
     }
     match (view, u.kind) {
@@ -2743,6 +2755,335 @@ void main(uint3 id : SV_DispatchThreadID) {{
                 "{kind} w"
             );
         }
+    }
+
+    /// A widened RGB32 SRV sees a raw UAV write made earlier in the same
+    /// submission when the title issues a buffer barrier between them.
+    #[test]
+    fn a_widened_srv_sees_an_earlier_uav_write_in_the_same_submission() {
+        if !crate::shader_cache::under_wine() {
+            return;
+        }
+        let Some(host) = crate::host::host() else { return };
+        let (src, dst) = (buffer(48), buffer(256));
+        let (src_bytes, dst_bytes) = (
+            crate::resource::buffer_bytes(src).unwrap().0,
+            crate::resource::buffer_bytes(dst).unwrap().0,
+        );
+        let initial = [1000u32, 2000, 3000, 1003, 2003, 3003, 1006, 2006, 3006, 1009, 2009, 3009];
+        // SAFETY: the source buffer's 48 bytes.
+        unsafe { std::ptr::copy_nonoverlapping(initial.as_ptr().cast::<u8>(), src_bytes, 48) };
+
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        let mut heap = null;
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let title_heap = crate::descriptor::heap(heap);
+        // The raw view starts inside the second RGB32 element. Its range is
+        // dword-aligned, so it shares the source shadow, while the widening
+        // copy has to refresh the whole touched elements.
+        let source_raw = [39, 1, 5, 0, 6, 0, 0, 0, 1, 0];
+        let output_raw = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        let srv_words = [6, 1, 0x1688, 0, 0, 0, 4, 0, 0, 0];
+        crate::descriptor::create_uav(null, src, null, &source_raw, title_heap.start);
+        crate::descriptor::create_srv(null, src, &srv_words, title_heap.start + 32);
+        crate::descriptor::create_uav(null, dst, null, &output_raw, title_heap.start + 64);
+        let heap_host = title_heap.host().expect("a host view heap");
+        assert!(heap_host.made(0) && heap_host.kept(0), "the source UAV is made");
+        assert!(heap_host.made(1) && heap_host.kept(1), "the widened SRV is made");
+        assert!(heap_host.made(2) && heap_host.kept(2), "the output UAV is made");
+        assert_eq!(heap_host.widened_buffers().len(), 1, "one live widened source view");
+
+        let writer = compile_cs(
+            r#"
+RWByteAddressBuffer src : register(u0);
+[numthreads(1, 1, 1)]
+void main() { src.Store4(0, uint4(9, 8, 7, 0)); }
+"#,
+            &[Param::Table(&[uav(0, 1)])],
+        );
+        let writer_again = compile_cs(
+            r#"
+RWByteAddressBuffer src : register(u0);
+[numthreads(1, 1, 1)]
+void main() { src.Store4(0, uint4(4, 5, 6, 7)); }
+"#,
+            &[Param::Table(&[uav(0, 1)])],
+        );
+        let reader = compile_cs(
+            r#"
+Buffer<uint4> src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+[numthreads(1, 1, 1)]
+void main() { dst.Store4(0, asuint(src[1])); }
+"#,
+            &[Param::Table(&[srv(0, 1)]), Param::Table(&[uav(0, 1)])],
+        );
+        let source_copy = crate::shadow::find(src_bytes as u64, 48).expect("the source copy");
+        source_copy.update(src_bytes as usize, 48);
+        let list = host.new_list().unwrap();
+        let source_view = crate::descriptor::view(title_heap.start).expect("the source UAV record");
+        readable(&list, &used(ResourceType::Uav), &source_view, false);
+        // SAFETY: an open list, live objects and descriptors in our heap.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+            list.list.SetComputeRootSignature(&writer.0);
+            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
+            list.list.SetPipelineState(&writer.1);
+            list.list.Dispatch(1, 1, 1);
+            list.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(None),
+                    }),
+                },
+            }]);
+        }
+        list.sync_widened();
+        // The title makes another RGB32 view after the barrier. Its CPU copy
+        // predates the UAV write, so its first read must also consume the
+        // writes retained from earlier in this list.
+        let late_srv_words = [7, 1, 0x1688, 0, 0, 0, 4, 0, 0, 0];
+        crate::descriptor::create_srv(null, src, &late_srv_words, title_heap.start + 96);
+        assert!(heap_host.made(3) && heap_host.kept(3), "the late SRV is made");
+        assert_eq!(heap_host.widened_buffers().len(), 2, "a distinct late widened view");
+        let late_view = crate::descriptor::view(title_heap.start + 96).expect("the late SRV record");
+        readable(&list, &used(ResourceType::Srv), &late_view, false);
+        // SAFETY: the widening copy finished and the descriptors are live.
+        unsafe {
+            list.list.SetComputeRootSignature(&reader.0);
+            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(3));
+            list.list.SetComputeRootDescriptorTable(1, heap_host.gpu(2));
+            list.list.SetPipelineState(&reader.1);
+            list.list.Dispatch(1, 1, 1);
+        }
+        // A second write to the same range after the view is current must be
+        // pending work, not deduplicated against the retained history.
+        readable(&list, &used(ResourceType::Uav), &source_view, false);
+        // SAFETY: an open list, live objects and descriptors in our heap.
+        unsafe {
+            list.list.SetComputeRootSignature(&writer_again.0);
+            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
+            list.list.SetPipelineState(&writer_again.1);
+            list.list.Dispatch(1, 1, 1);
+            list.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(None),
+                    }),
+                },
+            }]);
+        }
+        list.sync_widened();
+        // SAFETY: the second widening copy finished.
+        unsafe {
+            list.list.SetComputeRootSignature(&reader.0);
+            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(3));
+            list.list.SetComputeRootDescriptorTable(1, heap_host.gpu(2));
+            list.list.SetPipelineState(&reader.1);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(
+            source_copy.read_host(src_bytes as u64 + 20, 4),
+            [4, 5, 6, 7],
+            "the second raw UAV write reaches its shadow"
+        );
+        let out = crate::shadow::find(dst_bytes as u64, 256).expect("the output copy");
+        assert_eq!(out.read_host(dst_bytes as u64, 4), [1003, 2003, 4, 1]);
+    }
+
+    /// A heap-writing draw is sampled at its barrier. A widened view made
+    /// after that barrier must see the heap's then-current UAV range.
+    #[test]
+    fn a_late_widened_view_follows_a_bindless_write() {
+        if !crate::shader_cache::under_wine() {
+            return;
+        }
+        let Some(host) = crate::host::host() else { return };
+        let (src, dst) = (buffer(48), buffer(256));
+        let (src_bytes, dst_bytes) = (
+            crate::resource::buffer_bytes(src).unwrap().0,
+            crate::resource::buffer_bytes(dst).unwrap().0,
+        );
+        let initial = [1000u32, 2000, 3000, 1003, 2003, 3003, 1006, 2006, 3006, 1009, 2009, 3009];
+        // SAFETY: the source buffer's 48 bytes.
+        unsafe { std::ptr::copy_nonoverlapping(initial.as_ptr().cast::<u8>(), src_bytes, 48) };
+
+        let old_raw = [39, 1, 0, 0, 12, 0, 0, 0, 1, 0];
+        let new_raw = [39, 1, 3, 0, 9, 0, 0, 0, 1, 0];
+        let output_raw = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        let old = View::Unordered(src as usize, 0, Some(old_raw));
+        let new = View::Unordered(src as usize, 0, Some(new_raw));
+        let srv_view = View::Shader(src as usize, Some([7, 1, 0x1688, 0, 0, 0, 4, 0, 0, 0]));
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 3, 1, 0, 0, 0, 0, 0];
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        let mut heap = null;
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let title_heap = crate::descriptor::heap(heap);
+        crate::descriptor::create_uav(null, src, null, &old_raw, title_heap.start);
+        crate::descriptor::create_uav(null, dst, null, &output_raw, title_heap.start + 64);
+        let heap_host = title_heap.host().expect("a host view heap");
+        let viewed = std::sync::Arc::new(crate::bindless::Viewed::default());
+        viewed.set(0, Some(&old), true);
+        crate::shadow::find(src_bytes as u64, 48).expect("the source copy").update(src_bytes as usize, 48);
+
+        let writer = compile_cs(
+            r#"
+RWByteAddressBuffer src : register(u0);
+[numthreads(1, 1, 1)]
+void main() { src.Store4(0, uint4(9, 8, 7, 0)); }
+"#,
+            &[Param::Table(&[uav(0, 1)])],
+        );
+        let reader = compile_cs(
+            r#"
+Buffer<uint4> src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+[numthreads(1, 1, 1)]
+void main() { dst.Store4(0, asuint(src[1])); }
+"#,
+            &[Param::Table(&[srv(0, 1)]), Param::Table(&[uav(0, 1)])],
+        );
+        let list = host.new_list().unwrap();
+        list.mark_widened_heap(&viewed);
+        // SAFETY: an open list and live descriptors.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+            list.list.SetComputeRootSignature(&writer.0);
+            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
+            list.list.SetPipelineState(&writer.1);
+            list.list.Dispatch(1, 1, 1);
+        }
+        // The title rewrites the heap slot before its barrier. Both the GPU
+        // descriptor and the range sampled for widening must name the new view.
+        crate::descriptor::create_uav(null, src, null, &new_raw, title_heap.start);
+        viewed.set(0, Some(&new), true);
+        // SAFETY: an open list.
+        unsafe {
+            list.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(None),
+                    }),
+                },
+            }]);
+        }
+        list.sync_widened();
+        // The range must be frozen at the barrier even when no widened view
+        // exists yet; the title can remove the heap slot before the first SRV.
+        viewed.set(0, None, true);
+        let srv_words = [7, 1, 0x1688, 0, 0, 0, 4, 0, 0, 0];
+        crate::descriptor::create_srv(null, src, &srv_words, title_heap.start + 32);
+        readable(&list, &used(ResourceType::Srv), &srv_view, false);
+        // SAFETY: the widening copy finished and the descriptors are live.
+        unsafe {
+            list.list.SetComputeRootSignature(&reader.0);
+            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(1));
+            list.list.SetComputeRootDescriptorTable(1, heap_host.gpu(2));
+            list.list.SetPipelineState(&reader.1);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        let source = crate::shadow::find(src_bytes as u64, 48).expect("the source copy");
+        assert_eq!(source.read_host(src_bytes as u64 + 12, 4), [9, 8, 7, 0]);
+        let out = crate::shadow::find(dst_bytes as u64, 256).expect("the output copy");
+        assert_eq!(out.read_host(dst_bytes as u64, 4), [9, 8, 7, 1]);
+    }
+
+    /// Root UAVs declare their writes outside `readable`; they must refresh a
+    /// widened SRV after a barrier just like table UAVs do.
+    #[test]
+    fn a_root_uav_write_reaches_a_widened_srv_in_the_same_submission() {
+        if !crate::shader_cache::under_wine() {
+            return;
+        }
+        let Some(host) = crate::host::host() else { return };
+        let (src, dst) = (buffer(48), buffer(256));
+        let (src_bytes, dst_bytes) = (
+            crate::resource::buffer_bytes(src).unwrap().0,
+            crate::resource::buffer_bytes(dst).unwrap().0,
+        );
+        let initial = [1000u32, 2000, 3000, 1003, 2003, 3003, 1006, 2006, 3006, 1009, 2009, 3009];
+        // SAFETY: the source buffer's 48 bytes.
+        unsafe { std::ptr::copy_nonoverlapping(initial.as_ptr().cast::<u8>(), src_bytes, 48) };
+
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 2, 1, 0, 0, 0, 0, 0];
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        let mut heap = null;
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let title_heap = crate::descriptor::heap(heap);
+        let srv_words = [6, 1, 0x1688, 0, 0, 0, 4, 0, 0, 0];
+        let output_raw = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        crate::descriptor::create_srv(null, src, &srv_words, title_heap.start);
+        crate::descriptor::create_uav(null, dst, null, &output_raw, title_heap.start + 32);
+        let heap_host = title_heap.host().expect("a host view heap");
+        let source_view = crate::descriptor::view(title_heap.start).expect("the source SRV");
+
+        let writer = compile_cs(
+            r#"
+RWByteAddressBuffer src : register(u0);
+[numthreads(1, 1, 1)]
+void main() { src.Store4(0, uint4(9, 8, 7, 0)); }
+"#,
+            &[Param::Table(&[uav(0, 1)])],
+        );
+        let reader = compile_cs(
+            r#"
+Buffer<float4> src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+[numthreads(1, 1, 1)]
+void main() { dst.Store4(0, asuint(src[0])); }
+"#,
+            &[Param::Table(&[srv(0, 1)]), Param::Table(&[uav(0, 1)])],
+        );
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        state.set_view(true, 0, src_bytes as u64);
+        let (writer_slot, _) = state.root_view(&list, true, 0, true).expect("a root UAV");
+        // SAFETY: an open list, live objects and descriptors in our heap.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+            list.list.SetComputeRootSignature(&writer.0);
+            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(writer_slot));
+            list.list.SetPipelineState(&writer.1);
+            list.list.Dispatch(1, 1, 1);
+            list.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(None),
+                    }),
+                },
+            }]);
+        }
+        list.sync_widened();
+        readable(&list, &used(ResourceType::Srv), &source_view, false);
+        // SAFETY: the widening copy finished and the descriptors are live.
+        unsafe {
+            list.list.SetComputeRootSignature(&reader.0);
+            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
+            list.list.SetComputeRootDescriptorTable(1, heap_host.gpu(1));
+            list.list.SetPipelineState(&reader.1);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        let out = crate::shadow::find(dst_bytes as u64, 256).expect("the output copy");
+        assert_eq!(out.read_host(dst_bytes as u64, 4), [9, 8, 7, 1.0f32.to_bits()]);
     }
 
     /// Root views (`victory_shader::emit`, "Root SRVs and root UAVs") through

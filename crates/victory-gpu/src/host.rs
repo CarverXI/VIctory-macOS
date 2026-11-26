@@ -929,6 +929,14 @@ pub(crate) mod tests {
     }
 }
 
+type WidenedWrite = (std::sync::Arc<crate::shadow::Shadow>, usize, usize);
+
+/// UAV writes and heap-writing draws in command-recording order.
+enum WidenedEvent {
+    Write(WidenedWrite),
+    Heap(std::sync::Arc<crate::bindless::Viewed>),
+}
+
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
@@ -953,6 +961,19 @@ pub(crate) struct HostList {
     /// A copy of ours replaced the list's compute root signature and
     /// pipeline: draws and dispatches set theirs again.
     rebind: std::sync::atomic::AtomicBool,
+    /// Shadow ranges written through UAVs: the history late views may need,
+    /// and ordered events written since the last barrier.
+    widened_writes: Mutex<Vec<WidenedWrite>>,
+    widened_pending: Mutex<Vec<WidenedEvent>>,
+    /// Exact source shadows whose buffers widening commands read. Their COM
+    /// objects alone do not keep an arena slice out of the reuse pool.
+    widened_sources: Mutex<Vec<std::sync::Arc<crate::shadow::Shadow>>>,
+    /// Widened buffers that have consumed every write recorded so far.
+    widened_ready: Mutex<std::collections::HashSet<usize>>,
+    /// Widened buffers this list has transitioned, by host address.
+    widened_states: Mutex<
+        std::collections::HashMap<usize, (ID3D12Resource, D3D12_RESOURCE_STATES)>,
+    >,
     /// A list of ours (uploads), whose uses are no use of the title's
     /// (`crate::resource::evict`).
     ours: std::sync::atomic::AtomicBool,
@@ -1306,6 +1327,11 @@ impl Host {
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 rebind: false.into(),
+                widened_writes: Mutex::default(),
+                widened_pending: Mutex::default(),
+                widened_sources: Mutex::default(),
+                widened_ready: Mutex::default(),
+                widened_states: Mutex::default(),
                 ours: false.into(),
                 memory_writer: false.into(),
                 prelude: (prelude_allocator, prelude),
@@ -2160,6 +2186,7 @@ impl HostList {
                     .ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
+        self.widen_close();
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
@@ -2174,6 +2201,11 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.widened_writes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.widened_pending.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.widened_sources.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.widened_ready.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.widened_states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -2307,6 +2339,161 @@ impl HostList {
     /// again (once).
     pub(crate) fn take_rebind(&self) -> bool {
         self.rebind.swap(false, Ordering::Relaxed)
+    }
+
+    /// A widened SRV is about to be read by this list. A view first made after
+    /// an earlier barrier also needs the writes retained since this list began.
+    pub(crate) fn mark_widened_read(&self, buffer: &ID3D12Resource) {
+        let key = buffer.as_raw() as usize;
+        let ready = self
+            .widened_ready
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&key);
+        if !ready {
+            self.sync_widened();
+        }
+        // Reads need no transition: a cached view is either still common or
+        // was left shader-readable by its last widening copy.
+    }
+
+    /// A UAV wrote a shadow range that may feed a widened SRV after a later
+    /// buffer barrier. Keep writes even before the first widened view exists.
+    pub(crate) fn mark_widened_write(
+        &self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+    ) {
+        if !crate::shader_cache::under_wine() || len == 0 {
+            return;
+        }
+        self.widened_pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(WidenedEvent::Write((shadow.clone(), address, len)));
+    }
+
+    /// A heap-indexing shader may write through any of this heap's current
+    /// UAV views. Its ranges are read at the barrier, not while binding.
+    pub(crate) fn mark_widened_heap(&self, heap: &std::sync::Arc<crate::bindless::Viewed>) {
+        if !crate::shader_cache::under_wine() {
+            return;
+        }
+        self.widened_pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(WidenedEvent::Heap(heap.clone()));
+    }
+
+    /// Keeps an exact source shadow's arena slice alive until the list resets.
+    pub(crate) fn keep_shadow(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>) {
+        let mut sources = self.widened_sources.lock().unwrap_or_else(|e| e.into_inner());
+        if !sources.iter().any(|other| std::sync::Arc::ptr_eq(shadow, other)) {
+            sources.push(shadow.clone());
+        }
+    }
+
+    /// After the title's buffer/UAV barrier, widen the shadow ranges written
+    /// before it so later SRVs in this submission see the UAV output.
+    pub(crate) fn sync_widened(&self) {
+        let mut pending = self.widened_pending.lock().unwrap_or_else(|e| e.into_inner());
+        let events = std::mem::take(&mut *pending);
+        let mut expanded = Vec::new();
+        for event in events {
+            match event {
+                WidenedEvent::Write(write) => expanded.push(WidenedEvent::Write(write)),
+                WidenedEvent::Heap(heap) => {
+                    expanded.extend(
+                        crate::bindless::widened_writes(&heap)
+                            .into_iter()
+                            .map(WidenedEvent::Write),
+                    );
+                }
+            }
+        }
+        *pending = expanded;
+        let sampled: Vec<_> = pending
+            .iter()
+            .map(|event| match event {
+                WidenedEvent::Write(write) => write.clone(),
+                WidenedEvent::Heap(_) => unreachable!("heap events expanded above"),
+            })
+            .collect();
+        if !crate::shadow::WIDENED_ANY.load(Ordering::Acquire) {
+            self.widened_writes.lock().unwrap_or_else(|e| e.into_inner()).extend(sampled);
+            pending.clear();
+            return;
+        }
+        let ready = self.widened_ready.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if sampled.is_empty()
+            && crate::shadow::widened_all().iter().all(|view| {
+                ready.contains(&(view.buffer.as_raw() as usize))
+            })
+        {
+            return;
+        }
+        let history = self.widened_writes.lock().unwrap_or_else(|e| e.into_inner());
+        let synced = history.len();
+        let mut writes = history.clone();
+        writes.extend(sampled.iter().cloned());
+        drop(history);
+        if writes.is_empty() {
+            return;
+        }
+        let Some(views) = crate::widened::sync(self, &writes, synced, &ready) else {
+            return;
+        };
+        self.widened_writes.lock().unwrap_or_else(|e| e.into_inner()).extend(sampled);
+        pending.clear();
+        self.widened_ready.lock().unwrap_or_else(|e| e.into_inner()).extend(views);
+    }
+
+    /// Moves widened buffers into the unordered state for widening copies.
+    pub(crate) fn widen_begin_all(&self, buffers: &[ID3D12Resource]) {
+        for buffer in buffers {
+            self.widen_state(buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+    }
+
+    /// Widening copies are complete; later shaders read these buffers.
+    pub(crate) fn widen_end_all(&self, buffers: &[ID3D12Resource]) {
+        for buffer in buffers {
+            self.widen_state(buffer, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+        }
+    }
+
+    fn widen_state(&self, buffer: &ID3D12Resource, wanted: D3D12_RESOURCE_STATES) {
+        let key = buffer.as_raw() as usize;
+        let mut states = self.widened_states.lock().unwrap_or_else(|e| e.into_inner());
+        let before = states.get(&key).map_or(D3D12_RESOURCE_STATE_COMMON, |(_, state)| *state);
+        if before == wanted {
+            return;
+        }
+        states.insert(key, (buffer.clone(), wanted));
+        drop(states);
+        self.keep(buffer);
+        // SAFETY: an open list and a live widened buffer.
+        unsafe {
+            self.list.ResourceBarrier(&[transition(buffer, before, wanted)]);
+        }
+    }
+
+    /// Returns widened buffers to common so the CPU can refresh them before
+    /// the next submission.
+    fn widen_close(&self) {
+        self.widened_writes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.widened_pending.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.widened_ready.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let states = std::mem::take(&mut *self.widened_states.lock().unwrap_or_else(|e| e.into_inner()));
+        for (_, (buffer, before)) in states {
+            if before != D3D12_RESOURCE_STATE_COMMON {
+                // SAFETY: an open list and a live widened buffer.
+                unsafe {
+                    self.list.ResourceBarrier(&[transition(&buffer, before, D3D12_RESOURCE_STATE_COMMON)]);
+                }
+            }
+        }
     }
 
     /// At submission: the list that moves each texture this list uses from

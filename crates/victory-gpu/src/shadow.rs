@@ -116,9 +116,10 @@ pub(crate) struct Shadow {
 pub(crate) struct Widened {
     pub(crate) buffer: ID3D12Resource,
     data: *mut u8,
-    start: u64,
-    len: u64,
-    w: u32,
+    pub(crate) start: u64,
+    pub(crate) len: u64,
+    pub(crate) w: u32,
+    source: Arc<Shadow>,
 }
 
 // SAFETY: the resource is free-threaded; `data` is a persistent mapping
@@ -130,12 +131,61 @@ unsafe impl Sync for Widened {}
 /// Widened views by source range and fourth-component bits.
 type WidenedViews = Vec<(u64, u64, u32, std::sync::Weak<Widened>)>;
 
+/// Widened views by title range, including views whose exact shadow differs
+/// from the parent shadow a raw UAV writes.
+static WIDENED_RANGES: Mutex<Vec<(u64, u64, std::sync::Weak<Widened>)>> = Mutex::new(Vec::new());
+/// Whether any widened view has been made. Writes are retained from the start
+/// of a list, so the first view made after a write can still consume them.
+pub(crate) static WIDENED_ANY: AtomicBool = AtomicBool::new(false);
+
+fn live_widened() -> Vec<Arc<Widened>> {
+    let mut ranges = WIDENED_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+    if ranges.len().is_power_of_two() {
+        ranges.retain(|(_, _, view)| view.strong_count() > 0);
+    }
+    ranges.iter().filter_map(|(_, _, view)| view.upgrade()).collect()
+}
+
+/// Every live widened view, for lists tracking which ones caught up with writes.
+pub(crate) fn widened_all() -> Vec<Arc<Widened>> {
+    live_widened()
+}
+
+/// Live widened views overlapping a title-memory range, across shadows.
+pub(crate) fn widened_in(from: usize, to: usize) -> Vec<Arc<Widened>> {
+    if from >= to {
+        return Vec::new();
+    }
+    live_widened()
+        .into_iter()
+        .filter(|view| {
+            let end = view.start.saturating_add(view.len);
+            view.start < to as u64 && (from as u64) < end
+        })
+        .collect()
+}
+
 #[cfg(test)]
 type WidenedPause = (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>);
 #[cfg(test)]
 static WIDENED_AFTER_REFRESH: Mutex<Vec<(u64, WidenedPause)>> = Mutex::new(Vec::new());
 
 impl Widened {
+    /// The normal shadow this cache was expanded from.
+    pub(crate) fn source(&self) -> Arc<Shadow> {
+        self.source.clone()
+    }
+
+    /// The whole elements of this view touched by `[from, to)`, as indices
+    /// into the widened buffer. Raw UAV writes can touch part of an element.
+    pub(crate) fn overlap(&self, from: usize, to: usize) -> Option<(usize, usize)> {
+        let start = self.start as usize;
+        let end = start.saturating_add(self.len as usize);
+        let from = from.max(start);
+        let to = to.min(end);
+        (from < to).then(|| ((from - start) / 12, (to - start).div_ceil(12)))
+    }
+
     fn refresh(&self, shadow: &Shadow, from: usize, to: usize) {
         let start = self.start as usize;
         let end = start + self.len as usize;
@@ -295,13 +345,14 @@ impl Shadow {
             return Some(view);
         }
         let count = len / 12;
-        let (buffer, data) = host()?.upload_buffer(count * 16)?;
+        let (buffer, data) = host()?.shared_buffer(count * 16)?;
         let widened = Arc::new(Widened {
             buffer,
             data,
             start: address,
             len,
             w,
+            source: self.clone(),
         });
         widened.refresh(self, address as usize, (address + len) as usize);
         #[cfg(test)]
@@ -332,6 +383,12 @@ impl Shadow {
         }
         views.push((address, len, w, Arc::downgrade(&widened)));
         drop(views);
+        let mut ranges = WIDENED_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        if ranges.len().is_power_of_two() {
+            ranges.retain(|(_, _, view)| view.strong_count() > 0);
+        }
+        ranges.push((address, len, Arc::downgrade(&widened)));
+        WIDENED_ANY.store(true, Ordering::Release);
         self.has_widened.store(true, Ordering::Release);
         Some(widened)
     }
@@ -478,6 +535,7 @@ impl Shadow {
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize, marked && self.marked());
+        list.mark_widened_write(self, address as usize, len as usize);
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
@@ -2101,6 +2159,158 @@ pub(crate) mod tests {
         drop((widened, copy));
         unregister(p, p as u64);
         crate::watch::tests::free(p);
+    }
+
+    /// A write through a distinct exact shadow patches the touched bytes of
+    /// a widened element even when that shadow does not hold all 12 bytes.
+    #[test]
+    fn widened_views_patch_partial_elements_from_another_shadow() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let host = host().unwrap();
+        let start = 0x1000u64;
+        let (parent_buffer, parent_data) = host.shared_buffer(48).unwrap();
+        // SAFETY: a live buffer.
+        let parent_gpu = unsafe { parent_buffer.GetGPUVirtualAddress() };
+        let parent = Shadow::new(parent_buffer, parent_data, parent_gpu, start, 48);
+        // SAFETY: the parent shadow's 48 bytes.
+        unsafe { std::ptr::write_bytes(parent_data, 0, 48) };
+
+        let (writer_buffer, writer_data) = host.shared_buffer(16).unwrap();
+        // SAFETY: a live buffer.
+        let writer_gpu = unsafe { writer_buffer.GetGPUVirtualAddress() };
+        let writer = Shadow::new(writer_buffer, writer_data, writer_gpu, start + 9, 15);
+        let changed: [u8; 15] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        // SAFETY: the exact shadow's bytes, standing in for an unaligned UAV write.
+        unsafe { std::ptr::copy_nonoverlapping(changed.as_ptr(), writer_data, 15) };
+        let (overlap_buffer, overlap_data) = host.shared_buffer(12).unwrap();
+        // SAFETY: a live buffer.
+        let overlap_gpu = unsafe { overlap_buffer.GetGPUVirtualAddress() };
+        let overlap = Shadow::new(overlap_buffer, overlap_data, overlap_gpu, start + 10, 10);
+        let overlaid: [u8; 10] = [101, 102, 103, 104, 105, 106, 107, 108, 109, 110];
+        // SAFETY: the second exact shadow's bytes.
+        unsafe { std::ptr::copy_nonoverlapping(overlaid.as_ptr(), overlap_data, 10) };
+
+        let widened = parent.widened(start, 48, 1).expect("a widened view");
+        let list = host.new_list().unwrap();
+        let writes = [
+            (writer, start as usize + 9, 15),
+            (overlap, start as usize + 10, 10),
+        ];
+        assert!(crate::widened::sync(
+            &list,
+            &writes,
+            0,
+            &std::collections::HashSet::new(),
+        )
+        .is_some());
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(
+            widened.read_host(8),
+            [0, 0, 0x6665_0100, 1, 0x6a69_6867, 0x6e6d_6c6b, 0x0f0e_0d0c, 1]
+        );
+
+    }
+
+    /// Partial patches through different exact shadows compose across
+    /// barriers instead of resetting earlier widened-only bytes.
+    #[test]
+    fn widened_views_compose_patches_across_barriers() {
+        use windows::core::Interface;
+
+        if host().is_none() {
+            return;
+        }
+        let host = host().unwrap();
+        let start = 0x1000u64;
+        let (parent_buffer, parent_data) = host.shared_buffer(12).unwrap();
+        // SAFETY: a live buffer.
+        let parent_gpu = unsafe { parent_buffer.GetGPUVirtualAddress() };
+        let parent = Shadow::new(parent_buffer, parent_data, parent_gpu, start, 12);
+        // SAFETY: the parent shadow's 12 bytes.
+        unsafe { std::ptr::write_bytes(parent_data, 0, 12) };
+        let widened = parent.widened(start, 12, 1).expect("a widened view");
+
+        let (first_buffer, first_data) = host.shared_buffer(8).unwrap();
+        // SAFETY: a live buffer.
+        let first_gpu = unsafe { first_buffer.GetGPUVirtualAddress() };
+        let first = Shadow::new(first_buffer, first_data, first_gpu, start + 2, 4);
+        let first_bytes = [1u8, 2, 3, 4];
+        // SAFETY: the first exact shadow's four bytes.
+        unsafe { std::ptr::copy_nonoverlapping(first_bytes.as_ptr(), first_data, 4) };
+        let list = host.new_list().unwrap();
+        let writes = [(first.clone(), start as usize + 2, 4)];
+        assert!(crate::widened::sync(
+            &list,
+            &writes,
+            0,
+            &std::collections::HashSet::new(),
+        )
+        .is_some());
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(widened.read_host(4), [0x0201_0000, 0x0000_0403, 0, 1]);
+
+        let (second_buffer, second_data) = host.shared_buffer(8).unwrap();
+        // SAFETY: a live buffer.
+        let second_gpu = unsafe { second_buffer.GetGPUVirtualAddress() };
+        let second = Shadow::new(second_buffer, second_data, second_gpu, start + 6, 4);
+        let second_bytes = [5u8, 6, 7, 8];
+        // SAFETY: the second exact shadow's four bytes.
+        unsafe { std::ptr::copy_nonoverlapping(second_bytes.as_ptr(), second_data, 4) };
+        let list = host.new_list().unwrap();
+        let writes = [
+            (first, start as usize + 2, 4),
+            (second, start as usize + 6, 4),
+        ];
+        let ready = std::collections::HashSet::from([widened.buffer.as_raw() as usize]);
+        assert!(crate::widened::sync(&list, &writes, 1, &ready).is_some());
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(widened.read_host(4), [0x0201_0000, 0x0605_0403, 0x0000_0807, 1]);
+    }
+
+    /// An element-aligned shadow that starts after the widened view cannot
+    /// back the direct source root SRV; it must use the composed patch path.
+    #[test]
+    fn widened_views_patch_an_aligned_later_shadow() {
+        if host().is_none() {
+            return;
+        }
+        let host = host().unwrap();
+        let start = 0x1000u64;
+        let (parent_buffer, parent_data) = host.shared_buffer(24).unwrap();
+        // SAFETY: a live buffer.
+        let parent_gpu = unsafe { parent_buffer.GetGPUVirtualAddress() };
+        let parent = Shadow::new(parent_buffer, parent_data, parent_gpu, start, 24);
+        // SAFETY: the parent shadow's 24 bytes.
+        unsafe { std::ptr::write_bytes(parent_data, 0, 24) };
+        let widened = parent.widened(start, 24, 1).expect("a widened view");
+
+        let (later_buffer, later_data) = host.shared_buffer(12).unwrap();
+        // SAFETY: a live buffer.
+        let later_gpu = unsafe { later_buffer.GetGPUVirtualAddress() };
+        let later = Shadow::new(later_buffer, later_data, later_gpu, start + 12, 12);
+        let changed: [u8; 12] = [21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32];
+        // SAFETY: the later shadow's one element.
+        unsafe { std::ptr::copy_nonoverlapping(changed.as_ptr(), later_data, 12) };
+        let list = host.new_list().unwrap();
+        let writes = [(later, start as usize + 12, 12)];
+        assert!(crate::widened::sync(
+            &list,
+            &writes,
+            0,
+            &std::collections::HashSet::new(),
+        )
+        .is_some());
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(
+            widened.read_host(8),
+            [0, 0, 0, 1, 0x1817_1615, 0x1c1b_1a19, 0x201f_1e1d, 1]
+        );
     }
 
     /// Pages shaders marked (`copy_back_marks`, `victory_shader::emit`
