@@ -1061,6 +1061,24 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     }
 }
 
+/// Reports GPU shader writes into aliased title memory `[at, at + len)` so
+/// any other trackers over those pages (such as textures' staging) know they
+/// changed and re-upload on next use. Fast-paths out when no tracker or alias
+/// covers the range.
+pub(crate) fn notify_written(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    let mut g = guards();
+    if g.holders.range(first..last).next().is_none()
+        && g.alias_of.range(first..last).next().is_none()
+    {
+        return;
+    }
+    changed(&mut g, first, last, false);
+}
+
 /// What shaders wrote into host copies of `[at, at + len)` is dropped:
 /// every host buffer copy holding the memory takes it from title memory
 /// again at its next refresh (the pages count as changed in each, aliases

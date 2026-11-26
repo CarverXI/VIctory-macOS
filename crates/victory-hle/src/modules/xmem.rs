@@ -175,6 +175,17 @@ pub extern "system" fn XMemVirtualAlloc(
             );
         }
     }
+    if !at.is_null()
+        && victory_gpu::alias_buffers()
+        && kind & MEM_COMMIT != 0
+        && kind & MEM_RESERVE_PLACEHOLDER == 0
+        && protect == PAGE_READWRITE
+        && (at as usize).is_multiple_of(PAGE)
+        && size >= PAGE
+        && size.is_multiple_of(PAGE)
+    {
+        victory_gpu::alias_region(at as usize, size, false);
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -341,6 +352,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            victory_gpu::unalias_region(address as usize);
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
