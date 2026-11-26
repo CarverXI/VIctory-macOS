@@ -2458,6 +2458,10 @@ impl HostList {
 
     /// Brings the buffer range of the view currently in `index` up to date
     /// when the list is submitted, once until a title write intervenes.
+    ///
+    /// Measuring: one step per slot a table draw reads (the set above keeps
+    /// repeats out), timed with the refreshes in `StepRefreshUs`, and a slot
+    /// whose buffer is clean adds nothing to the batch.
     pub(crate) fn defer_slot(&self, viewed: &std::sync::Arc<crate::bindless::Viewed>, index: u32) {
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(viewed) as usize, index);
