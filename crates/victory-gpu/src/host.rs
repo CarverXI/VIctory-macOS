@@ -69,6 +69,7 @@ pub(crate) struct Host {
     /// The direct queue; a new one replaces it when it stops running work
     /// ([`Host::lost`]).
     queue: Mutex<ID3D12CommandQueue>,
+    pub(crate) depth_bounds_supported: bool,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
@@ -307,6 +308,15 @@ fn create() -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
+        let depth_bounds_supported = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS2,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+            .is_ok()
+            && options.DepthBoundsTestSupported.as_bool();
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -342,10 +352,7 @@ fn create() -> windows::core::Result<Host> {
         // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
         // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
         // host chooses (the RX 6700 XT does, WARP does not).
-        match (victory_shader::emit::host::Host {
-            device: device.clone(),
-        })
-        .fuses_fmad()
+        match victory_shader::emit::host::Host::from_device(device.clone()).fuses_fmad()
         {
             Ok(true) => {}
             Ok(false) => tracing::warn!(
@@ -356,6 +363,7 @@ fn create() -> windows::core::Result<Host> {
         Ok(Host {
             device,
             queue: Mutex::new(queue),
+            depth_bounds_supported,
             fence,
             submitted: Mutex::new(0),
             mark: OnceLock::new(),
@@ -921,6 +929,7 @@ pub(crate) mod tests {
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
+    pub(crate) depth_bounds: Option<ID3D12GraphicsCommandList1>,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -979,6 +988,11 @@ pub(crate) struct HostList {
 unsafe impl Send for HostList {}
 // SAFETY: as above.
 unsafe impl Sync for HostList {}
+
+pub(crate) fn warn_depth_bounds() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| tracing::warn!("the host GPU has no depth bounds test; depth bounds are ignored"));
+}
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
@@ -1207,9 +1221,7 @@ impl Host {
     pub(crate) fn wave32(&self) -> bool {
         static WAVE32: OnceLock<bool> = OnceLock::new();
         *WAVE32.get_or_init(|| {
-            let host = victory_shader::emit::host::Host {
-                device: self.device.clone(),
-            };
+            let host = victory_shader::emit::host::Host::from_device(self.device.clone());
             match host.wave32() {
                 Ok(wave32) => {
                     tracing::info!(wave32, "host waves of 32 lanes at most");
@@ -1283,6 +1295,7 @@ impl Host {
             name(&list, || list_name(id));
             Ok(HostList {
                 allocator,
+                depth_bounds: self.depth_bounds_supported.then(|| list.cast()).transpose()?,
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
@@ -3374,6 +3387,10 @@ struct SwapChainRetry {
 }
 
 impl SwapChainRetry {
+    fn ready(&self, now: Instant) -> bool {
+        self.next_attempt.is_none_or(|next| now >= next)
+    }
+
     /// A desktop can become presentable again. Keep retrying while limiting
     /// the DXGI calls and warnings during the outage.
     fn attempt<T, E>(
@@ -3381,7 +3398,7 @@ impl SwapChainRetry {
         now: Instant,
         operation: impl FnOnce() -> Result<T, E>,
     ) -> Option<Result<T, E>> {
-        if self.next_attempt.is_some_and(|next| now < next) {
+        if !self.ready(now) {
             return None;
         }
         let result = operation();
@@ -3411,8 +3428,7 @@ struct Presenter {
 struct Meter {
     since: std::time::Instant,
     frames: u32,
-    #[cfg(feature = "diagnostics")]
-    copy_stats_frames: u64,
+    report_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
     /// The caption the window had, once read.
@@ -3425,8 +3441,7 @@ impl Meter {
         Meter {
             since: now,
             frames: 0,
-            #[cfg(feature = "diagnostics")]
-            copy_stats_frames: 0,
+            report_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
@@ -3441,10 +3456,7 @@ impl Meter {
         crate::memory::log_frame();
         #[cfg(feature = "diagnostics")]
         crate::watch::frame_done();
-        #[cfg(feature = "diagnostics")]
-        {
-            self.copy_stats_frames += 1;
-        }
+        self.report_frames += 1;
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
             return;
@@ -3462,17 +3474,17 @@ impl Meter {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
         });
-        let [back_ms, back_mb] =
-            [0, 1].map(|i| COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames);
-        let dropped = crate::draw::take_dropped() as f64 / frames;
-        let indirect = crate::list::take_indirect() as f64 / frames;
-        let [records, counted] = crate::indirect::take_records().map(|n| n as f64 / frames);
-        let root_views = crate::draw::take_root_view_slots() as f64 / frames;
-        // Over the same frames as the counts above.
-        #[cfg(feature = "diagnostics")]
-        let drops = crate::pipeline::take_drops();
+        let [back_ms, back_mb] = [0, 1].map(|i| {
+            COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
+        });
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            let report_frames = std::mem::take(&mut self.report_frames) as f64;
+            let dropped = crate::draw::take_dropped() as f64 / report_frames;
+            let indirect = crate::list::take_indirect() as f64 / report_frames;
+            let root_views = crate::draw::take_root_view_slots() as f64 / report_frames;
+            let [records, counted] =
+                crate::indirect::take_records().map(|n| n as f64 / report_frames);
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -3493,8 +3505,8 @@ impl Meter {
                 saved as f64 / 1e6,
                 heap_used as f64 / 1e6,
                 heap_free as f64 / 1e6,
-                crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / frames,
-                crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / frames,
+                crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
+                crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
             );
             #[cfg(feature = "diagnostics")]
             {
@@ -3525,24 +3537,25 @@ impl Meter {
                     given_bytes as f64 / 1e6,
                     crate::resource::SOON_FRAMES,
                 );
-                let copy_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
+                // Window caption updates leave the report counters intact.
+                let drops = crate::pipeline::take_drops();
                 crate::frame::log();
-                log_gpu_times(copy_frames);
-                crate::copystat::log(copy_frames);
-                crate::bindless::log(copy_frames);
-                crate::shadow::log_views(copy_frames);
+                log_gpu_times(report_frames);
+                crate::copystat::log(report_frames);
+                crate::bindless::log(report_frames);
+                crate::shadow::log_views(report_frames);
                 let [n, bytes] = [0, 1].map(|i| crate::list::READ_BACKS[i].swap(0, Ordering::Relaxed));
                 if n > 0 {
                     tracing::info!(
                         "texture read backs: {:.1}/frame, {:.1} KB/frame",
-                        n as f64 / frames,
-                        bytes as f64 / frames / 1e3
+                        n as f64 / report_frames,
+                        bytes as f64 / report_frames / 1e3
                     );
                 }
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
-                        *n as f64 / frames
+                        *n as f64 / report_frames
                     );
                 }
             }
