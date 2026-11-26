@@ -121,7 +121,7 @@ fn copier() -> Option<&'static Copier> {
         .as_ref()
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum JobKind {
     /// Whole elements from `first` to the exclusive `last` index.
     Widen { first: usize, last: usize },
@@ -268,8 +268,13 @@ pub(crate) fn sync(
     }
     let mut groups = Vec::new();
     for (view, jobs) in grouped {
-        let kind = if jobs.len() == 1
-            && let JobKind::Widen { first, last } = jobs[0].kind
+        // At this barrier repeated writes of the same whole elements are
+        // all read from the same current shadow. Use the direct GPU copy.
+        let job = &jobs[0];
+        let kind = if let JobKind::Widen { first, last } = job.kind
+            && jobs[1..]
+                .iter()
+                .all(|other| Arc::ptr_eq(&job.shadow, &other.shadow) && job.kind == other.kind)
         {
             if u32::try_from(first).is_err()
                 || u32::try_from(last).is_err()
@@ -278,7 +283,7 @@ pub(crate) fn sync(
                 return None;
             }
             GroupKind::Widen {
-                shadow: jobs[0].shadow.clone(),
+                shadow: job.shadow.clone(),
                 first,
                 last,
             }

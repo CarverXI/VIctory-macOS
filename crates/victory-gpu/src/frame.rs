@@ -220,14 +220,18 @@ mod tests {
     #[test]
     fn waits_end_on_ticks_and_count_frames() {
         let null = std::ptr::null();
-        assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
+        // 50 ms ticks: with 2 ms ticks a thread woken a few ms late finds the
+        // next tick ready, and a wait with no time-out does not time out.
+        assert_eq!(set_interval(null, null, 50_000, 1, 0), S_OK);
         let mut first = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut first), S_OK);
         let before = Instant::now();
         let mut second = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut second), S_OK);
         assert!(second > first);
-        assert!(before.elapsed() <= Duration::from_millis(50));
+        // A wait that ended on its tick, not on its 1 s time-out. The
+        // bound is wide because a busy CI host can wake a thread late.
+        assert!(before.elapsed() < Duration::from_millis(500), "{:?}", before.elapsed());
         assert_eq!(wait(null, 0, 0, std::ptr::null(), 0, &mut second), TIMEOUT);
         // Tokens count frames, a frame started early on a time-out too.
         let mut early = 0;
@@ -268,7 +272,8 @@ mod tests {
         std::thread::sleep(Duration::from_millis(110));
         let before = Instant::now();
         assert_eq!(wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token), S_OK);
-        assert!(before.elapsed() < Duration::from_millis(10), "{:?}", before.elapsed());
+        // The next tick is about 40 ms away, so 30 ms still tells "at once" from "waited".
+        assert!(before.elapsed() < Duration::from_millis(30), "{:?}", before.elapsed());
         let late = LAST[2].load(Ordering::Relaxed);
         assert!(late >= flips[3] + 2, "{late} after {}", flips[3]);
         assert_eq!(wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token), S_OK);
