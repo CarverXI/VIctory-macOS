@@ -569,9 +569,11 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             .collect();
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
-        if barriers.iter().any(|b| {
+        let buffer_barrier = barriers.iter().any(|b| {
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
-        }) {
+        });
+        let global_uav = barriers.iter().any(|b| b.kind == 2 && b.first.is_null());
+        if buffer_barrier {
             host.push(UAV_BARRIER);
         }
         if !host.is_empty() {
@@ -587,6 +589,9 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             };
             // SAFETY: an open list and live resources.
             unsafe { list.list.ResourceBarrier(host) };
+        }
+        if buffer_barrier || global_uav {
+            list.sync_widened();
         }
     }
     0
@@ -1728,6 +1733,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
             unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
+        list.sync_widened();
     }
     #[cfg(not(windows))]
     let _ = (this, count);

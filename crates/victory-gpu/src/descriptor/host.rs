@@ -5,6 +5,7 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -75,6 +76,9 @@ pub(crate) struct HostHeap {
     addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
     /// What the title slots view that title memory feeds (`crate::bindless`).
     pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
+    /// Live widened SRV buffers, by host address, with the number of slots
+    /// showing each. Heap-indexing shaders can read any of them.
+    widened: Mutex<HashMap<usize, (usize, std::sync::Weak<crate::shadow::Widened>)>>,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -236,6 +240,7 @@ impl HostHeap {
             marks,
             addresses: std::sync::OnceLock::new(),
             viewed: Default::default(),
+            widened: Default::default(),
         };
         if !sampler {
             crate::bindless::register(&h.viewed);
@@ -589,7 +594,17 @@ impl HostHeap {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         // A slot that held nothing and gets nothing is left alone (no page).
         if let Some(slot) = kept.slot(index as usize, resource.is_some()) {
+            let old_widened = slot.as_ref().and_then(|(_, source)| match source {
+                Some(HeldSource::Widened(view, _)) => Some(view.clone()),
+                _ => None,
+            });
+            let new_widened = resource.as_ref().and_then(|(_, source)| match source {
+                Some(HeldSource::Widened(view, _)) => Some(view.clone()),
+                _ => None,
+            });
             let old = std::mem::replace(slot, resource);
+            self.note_widened(old_widened.as_ref(), false);
+            self.note_widened(new_widened.as_ref(), true);
             #[cfg(feature = "diagnostics")]
             if let Some((old, _)) = &old
                 && !self.sampler
@@ -609,6 +624,31 @@ impl HostHeap {
                 crate::host::retire(old);
             }
         }
+    }
+
+    fn note_widened(&self, view: Option<&std::sync::Arc<crate::shadow::Widened>>, add: bool) {
+        let Some(view) = view else { return };
+        let key = std::sync::Arc::as_ptr(view) as usize;
+        let mut widened = self.widened.lock().unwrap_or_else(|e| e.into_inner());
+        if add {
+            let entry = widened.entry(key).or_insert_with(|| (0, std::sync::Arc::downgrade(view)));
+            entry.0 += 1;
+        } else if let Some((count, _)) = widened.get_mut(&key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                widened.remove(&key);
+            }
+        }
+    }
+
+    /// Widened SRV buffers a heap-indexing shader may read.
+    pub(crate) fn widened_buffers(&self) -> Vec<ID3D12Resource> {
+        self.widened
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter_map(|(_, view)| view.upgrade().map(|view| view.buffer.clone()))
+            .collect()
     }
 
     /// The host address of the slots' view addresses (see the field), made
@@ -1168,6 +1208,26 @@ fn widened_w(format: i32) -> Option<u32> {
         7 | 8 => Some(1),
         _ => None,
     }
+}
+
+/// Whether `view` is a typed three-channel 32-bit SRV backed by a widened
+/// host copy under Wine.
+pub(crate) fn three_channel_srv(view: &View) -> bool {
+    let words: &[u32; 10] = match view {
+        View::Shader(_, Some(desc)) => desc,
+        View::Placed(false, resource, desc) if resource[0] == 1 => match desc[..10].try_into() {
+            Ok(words) => words,
+            Err(_) => return false,
+        },
+        _ => return false,
+    };
+    let desc = srv_desc(words);
+    // SAFETY: a buffer view's union member.
+    let buffer = unsafe { desc.Anonymous.Buffer };
+    desc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER
+        && matches!(desc.Format.0, 6..=8)
+        && buffer.StructureByteStride == 0
+        && buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 == 0
 }
 
 /// Whether a DXGI format is an integer one, and if so whether signed:

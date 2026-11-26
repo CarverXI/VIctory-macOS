@@ -343,6 +343,25 @@ pub(crate) fn refresh_slot(
     }
 }
 
+/// Heap UAV ranges that may need to refresh a widened SRV after a later
+/// buffer barrier. Computed heap indices do not name ordinary write steps.
+pub(crate) fn widened_writes(viewed: &Viewed) -> Vec<(Arc<Shadow>, usize, usize)> {
+    if !crate::shader_cache::under_wine() {
+        return Vec::new();
+    }
+    viewed
+        .inner
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .ranges
+        .iter()
+        .filter(|((_, address, end, uav), _)| *uav && address < end)
+        .map(|((_, address, end, _), (_, shadow))| {
+            (shadow.clone(), *address as usize, (end - address) as usize)
+        })
+        .collect()
+}
+
 /// Draws and dispatches run with heap-indexing shaders, those of them
 /// writing through the heap, textures uploaded for heaps (diagnostics).
 static HEAP_DRAWS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];

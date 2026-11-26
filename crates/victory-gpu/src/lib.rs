@@ -77,6 +77,8 @@ mod texture;
 mod twin;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod widened;
 // Whether the host opens heaps over process memory (ignored by default).
 #[cfg(all(windows, test))]
 mod inplace_probe;
