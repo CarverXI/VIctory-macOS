@@ -17,7 +17,7 @@
 //! (`crate::bindless`).
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -47,11 +47,84 @@ pub(crate) struct Shadow {
     /// 64 KiB title page it touches (tracked memory only): writes through
     /// views of it are marked there ([`Shadow::mark_entry`]).
     marks: Option<u32>,
+    /// Widened three-channel views reading this copy, refreshed when their
+    /// source bytes change. The fourth component is part of the key: float
+    /// views need the bits of 1.0, integer views need the integer 1.
+    widened: Mutex<WidenedViews>,
+    /// Serializes source mutations with widened-cache construction and refresh.
+    ///
+    /// Lock order, outermost first: `widened_source`, then `before` and
+    /// `pending`, then `widened`. `Shadow::widened` holds `widened_source`
+    /// across `upload_buffer`, which takes no lock of ours (a plain D3D12
+    /// resource creation), and takes `widened` only for short lookups
+    /// inside it. Every path that writes the copy's bytes (`update`,
+    /// `copy_back_or_not`, `copy_back_marked`, `copy_back_page`) takes
+    /// `widened_source` first and then calls `refresh_widened`, which takes
+    /// only `widened`; none of them calls another that takes it again, as
+    /// the mutex is not reentrant.
+    widened_source: Mutex<()>,
+    has_widened: AtomicBool,
     /// Where it starts in `buffer` (0 but for copies sharing a buffer), and
     /// the run of the shared buffer it holds ([`Arena`]), given back when it
     /// goes.
     base: u64,
     slice: Option<Slice>,
+}
+
+/// A 16-byte-element host copy of a three-channel 32-bit buffer view. D3DMetal
+/// reads R32G32B32 typed SRVs as R32G32; an R32G32B32A32 view over this copy
+/// keeps the title's 12-byte stride and supplies `w` in the source format.
+pub(crate) struct Widened {
+    pub(crate) buffer: ID3D12Resource,
+    data: *mut u8,
+    start: u64,
+    len: u64,
+    w: u32,
+}
+
+// SAFETY: the resource is free-threaded; `data` is a persistent mapping
+// written only by the submitting thread.
+unsafe impl Send for Widened {}
+// SAFETY: as above.
+unsafe impl Sync for Widened {}
+
+/// Widened views by source range and fourth-component bits.
+type WidenedViews = Vec<(u64, u64, u32, std::sync::Weak<Widened>)>;
+
+#[cfg(test)]
+type WidenedPause = (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>);
+#[cfg(test)]
+static WIDENED_AFTER_REFRESH: Mutex<Vec<(u64, WidenedPause)>> = Mutex::new(Vec::new());
+
+impl Widened {
+    fn refresh(&self, shadow: &Shadow, from: usize, to: usize) {
+        let start = self.start as usize;
+        let end = start + self.len as usize;
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return;
+        }
+        let first = (from - start) / 12;
+        let last = (to - start).div_ceil(12);
+        // SAFETY: the source range is inside the shadow and the destination
+        // has one 16-byte element for each 12 source bytes.
+        unsafe {
+            let source = shadow.data.add(start - shadow.start as usize);
+            for i in first..last {
+                let at = source.add(i * 12);
+                let to = self.data.add(i * 16);
+                std::ptr::copy_nonoverlapping(at, to, 12);
+                to.add(12).cast::<u32>().write_volatile(self.w);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_host(&self, n: usize) -> Vec<u32> {
+        assert!(4 * n <= (self.len / 12 * 16) as usize);
+        // SAFETY: inside the mapped widened buffer; the GPU is done with it.
+        unsafe { std::slice::from_raw_parts(self.data.cast::<u32>(), n).to_vec() }
+    }
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
@@ -124,10 +197,14 @@ impl Shadow {
     /// do (tests).
     #[cfg(test)]
     pub(crate) fn write_host(&self, address: u64, bytes: &[u8]) {
+        let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
         let at = (address - self.start) as usize;
         assert!(at + bytes.len() <= self.len as usize);
-        // SAFETY: inside the mapping (checked).
+        // SAFETY: inside the mapping (checked); the GPU is done with it.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(at), bytes.len()) };
+        if self.has_widened.load(Ordering::Acquire) {
+            self.refresh_widened(address as usize, address as usize + bytes.len());
+        }
     }
 
     /// Up to 64 bytes of the copy at title address `address`, as floats, and
@@ -152,6 +229,87 @@ impl Shadow {
         (self.start, self.len)
     }
 
+    /// A widened copy of `len` bytes at `address` for a three-channel
+    /// 32-bit typed SRV. The source stays in its normal 12-byte layout;
+    /// this copy has 16-byte elements with the requested `w` bits.
+    pub(crate) fn widened(
+        self: &Arc<Self>,
+        address: u64,
+        len: u64,
+        w: u32,
+    ) -> Option<Arc<Widened>> {
+        if len == 0 || !len.is_multiple_of(12) {
+            return None;
+        }
+        let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
+        let found = || {
+            self.widened
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .find(|&&(start, size, fourth, _)| {
+                    start == address && size == len && fourth == w
+                })
+                .and_then(|(_, _, _, view)| view.upgrade())
+        };
+        if let Some(view) = found() {
+            return Some(view);
+        }
+        let count = len / 12;
+        let (buffer, data) = host()?.upload_buffer(count * 16)?;
+        let widened = Arc::new(Widened {
+            buffer,
+            data,
+            start: address,
+            len,
+            w,
+        });
+        widened.refresh(self, address as usize, (address + len) as usize);
+        #[cfg(test)]
+        if let Some((ready, resume)) = WIDENED_AFTER_REFRESH
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(start, _)| *start == self.start)
+            .map(|(_, barriers)| barriers.clone())
+        {
+            ready.wait();
+            resume.wait();
+        }
+        let mut views = self.widened.lock().unwrap_or_else(|e| e.into_inner());
+        // Another thread may have made the same view while this one was
+        // being allocated.
+        if let Some(view) = views
+            .iter()
+            .find(|&&(start, size, fourth, _)| {
+                start == address && size == len && fourth == w
+            })
+            .and_then(|(_, _, _, view)| view.upgrade())
+        {
+            return Some(view);
+        }
+        if views.len().is_power_of_two() {
+            views.retain(|(_, _, _, view)| view.strong_count() > 0);
+        }
+        views.push((address, len, w, Arc::downgrade(&widened)));
+        drop(views);
+        self.has_widened.store(true, Ordering::Release);
+        Some(widened)
+    }
+
+    fn refresh_widened(&self, from: usize, to: usize) {
+        let views: Vec<_> = self
+            .widened
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(|(_, _, _, view)| view.upgrade())
+            .collect();
+        for view in views {
+            view.refresh(self, from, to);
+        }
+    }
+
     /// After a submission whose shaders wrote title memory at addresses they
     /// computed (`crate::memory`), somewhere in the 64 KiB page at `page`:
     /// the bytes of the page (cut to the copy) that differ from title memory
@@ -167,6 +325,12 @@ impl Shadow {
         let (from, to) = (page.max(start), (page + PAGE).min(end));
         if from >= to {
             return 0;
+        }
+        let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
+        // The normal shadow holds the GPU's bytes even when title memory
+        // already matches or cannot be written; widened views still need them.
+        if self.has_widened.load(Ordering::Acquire) {
+            self.refresh_widened(from, to);
         }
         if let Some(t) = &self.tracked
             && t.changed(page / PAGE)
@@ -224,6 +388,9 @@ impl Shadow {
             pending: Mutex::default(),
             before: Mutex::default(),
             marks,
+            widened: Mutex::default(),
+            widened_source: Mutex::default(),
+            has_widened: AtomicBool::new(false),
             base: slice.map_or(0, |s| s.offset),
             slice,
         });
@@ -352,6 +519,7 @@ impl Shadow {
     }
 
     fn copy_back_or_not(&self, address: usize, len: usize, back: bool) -> usize {
+        let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (segments, compared) = &mut *snapshot;
         let mut written = 0;
@@ -404,6 +572,9 @@ impl Shadow {
                     }
                     synced.push((start + at) / PAGE);
                 }
+                if self.has_widened.load(Ordering::Acquire) {
+                    self.refresh_widened(start + at, start + at + n);
+                }
                 at += n;
             }
             // Pages made equal to title memory are current in the copy, so
@@ -414,6 +585,11 @@ impl Shadow {
                 let whole: Vec<usize> = synced.into_iter().filter(|p| (first..last).contains(p)).collect();
                 t.taken(&whole);
             }
+        }
+        // Kept GPU writes stay in the normal shadow for later submissions;
+        // their widened readers must follow even though nothing goes back.
+        if !back && from < to && self.has_widened.load(Ordering::Acquire) {
+            self.refresh_widened(start + from, start + to);
         }
         // Every submitted step that declared the range is done with it (one
         // submission runs at a time), and the snapshot with the last range.
@@ -443,6 +619,7 @@ impl Shadow {
     // the heap's views no list declared) keeps the title's bytes, losing
     // the shaders' there (counted).
     pub(crate) fn copy_back_marked(&self, pages: &[usize]) -> usize {
+        let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
         let Some(t) = &self.tracked else {
             return 0;
         };
@@ -499,6 +676,9 @@ impl Shadow {
             if differs {
                 writes.push((from, title));
             }
+            if self.has_widened.load(Ordering::Acquire) {
+                self.refresh_widened(from, to);
+            }
             // Equal to title memory now: taken, unless it holds the page in part.
             if from == page && to == page + PAGE {
                 taken.push(page / PAGE);
@@ -544,6 +724,7 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
         if self.clean() {
             return 0;
         }
@@ -641,6 +822,9 @@ impl Shadow {
             for (a, b) in unmapped {
                 // SAFETY: inside the mapping (`take_split` cuts to the buffer).
                 unsafe { self.data.add(a - self.start as usize).write_bytes(0, b - a) };
+                if self.has_widened.load(Ordering::Acquire) {
+                    self.refresh_widened(a, b);
+                }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::Unmapped, (b - a) as u64);
             }
@@ -684,6 +868,9 @@ impl Shadow {
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        if self.has_widened.load(Ordering::Acquire) {
+            self.refresh_widened(from, to);
+        }
         to - from
     }
 }
@@ -1689,6 +1876,169 @@ pub(crate) mod tests {
         assert_eq!([title(p + 20), title(p + 21), title(p + 22), title(p + PAGE + 5)], [1, 2, 3, 9]);
         assert_eq!(bytes(&copy), 0, "the snapshot goes with the last range");
         unregister(p, p as u64);
+    }
+
+    /// Publishing a widened view cannot miss a source update that runs while
+    /// its first copy is being made.
+    #[test]
+    fn widened_publication_serializes_with_source_updates() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let p = crate::watch::tests::pool(1);
+        let len = 4 * 12;
+        let first = [1000u32, 2000, 3000, 1003, 2003, 3003, 1006, 2006, 3006, 1009, 2009, 3009];
+        // SAFETY: 48 bytes of our pool page.
+        unsafe { std::ptr::copy_nonoverlapping(first.as_ptr().cast::<u8>(), p as *mut u8, len) };
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            crate::watch::tests::free(p);
+            return;
+        };
+        copy.update(p, len);
+
+        let ready = Arc::new(std::sync::Barrier::new(3));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        WIDENED_AFTER_REFRESH
+            .lock()
+            .unwrap()
+            .push((p as u64, (ready.clone(), resume.clone())));
+        let started = Arc::new(AtomicBool::new(false));
+        let making = copy.clone();
+        let constructor = std::thread::spawn(move || making.widened(p as u64, len as u64, 1));
+        let updating = copy.clone();
+        let update_started = started.clone();
+        let updater = {
+            let ready = ready.clone();
+            std::thread::spawn(move || {
+                ready.wait();
+                update_started.store(true, Ordering::Release);
+                let changed = [0x1111_1111, 0x2222_2222, 0x3333_3333];
+                // SAFETY: one 12-byte element of our pool page.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        changed.as_ptr().cast::<u8>(),
+                        (p + 12) as *mut u8,
+                        12,
+                    )
+                };
+                updating.update(p, len)
+            })
+        };
+        ready.wait();
+        while !started.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        // Without the source lock the update finishes here; with it, the
+        // updater waits until construction publishes and releases the lock.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        resume.wait();
+        let widened = constructor.join().unwrap().expect("a widened view");
+        assert!(updater.join().unwrap() > 0, "the source update runs");
+        WIDENED_AFTER_REFRESH
+            .lock()
+            .unwrap()
+            .retain(|(start, _)| *start != p as u64);
+        assert_eq!(
+            widened.read_host(16),
+            [
+                1000, 2000, 3000, 1, 0x1111_1111, 0x2222_2222, 0x3333_3333, 1, 1006, 2006, 3006,
+                1, 1009, 2009, 3009, 1,
+            ]
+        );
+        drop((widened, copy));
+        unregister(p, p as u64);
+        crate::watch::tests::free(p);
+    }
+
+    /// A widened view follows GPU-written bytes when the computed-memory
+    /// copy-back path puts the normal shadow's page into title memory.
+    #[test]
+    fn widened_views_follow_computed_copy_back_pages() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let p = crate::watch::tests::pool(1);
+        let len = 4 * 12;
+        let first = [1000u32, 2000, 3000, 1003, 2003, 3003, 1006, 2006, 3006, 1009, 2009, 3009];
+        // SAFETY: 48 bytes of our pool page.
+        unsafe { std::ptr::copy_nonoverlapping(first.as_ptr().cast::<u8>(), p as *mut u8, len) };
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            crate::watch::tests::free(p);
+            return;
+        };
+        copy.update(p, len);
+        let widened = copy.widened(p as u64, len as u64, 1).expect("a widened view");
+        let changed = [0x1111_1111, 0x2222_2222, 0x3333_3333];
+        // SAFETY: one 12-byte element of the mapped shadow, as a GPU write.
+        unsafe {
+            std::ptr::copy_nonoverlapping(changed.as_ptr().cast::<u8>(), copy.data.add(12), 12)
+        };
+        assert!(copy.copy_back_page(p) > 0, "the GPU-written page goes back");
+        assert_eq!(
+            widened.read_host(16),
+            [
+                1000, 2000, 3000, 1, 0x1111_1111, 0x2222_2222, 0x3333_3333, 1, 1006, 2006, 3006,
+                1, 1009, 2009, 3009, 1,
+            ]
+        );
+        let same = [0x4444_4444, 0x5555_5555, 0x6666_6666];
+        // SAFETY: title memory and its mapped shadow already hold the same
+        // GPU-written element, so copy-back takes its zero-write early return.
+        unsafe {
+            std::ptr::copy_nonoverlapping(same.as_ptr().cast::<u8>(), (p + 24) as *mut u8, 12);
+            std::ptr::copy_nonoverlapping(same.as_ptr().cast::<u8>(), copy.data.add(24), 12);
+        }
+        assert_eq!(copy.copy_back_page(p), 0, "title memory already matches");
+        assert_eq!(
+            widened.read_host(16),
+            [
+                1000, 2000, 3000, 1, 0x1111_1111, 0x2222_2222, 0x3333_3333, 1, 0x4444_4444,
+                0x5555_5555, 0x6666_6666, 1, 1009, 2009, 3009, 1,
+            ]
+        );
+        drop((widened, copy));
+        unregister(p, p as u64);
+        crate::watch::tests::free(p);
+    }
+
+    /// A widened view follows GPU-written bytes that stay in the normal
+    /// shadow for the next submission instead of going back to title memory.
+    #[test]
+    fn widened_views_follow_kept_gpu_writes() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let p = crate::watch::tests::pool(1);
+        let len = 4 * 12;
+        let first = [1000u32, 2000, 3000, 1003, 2003, 3003, 1006, 2006, 3006, 1009, 2009, 3009];
+        // SAFETY: 48 bytes of our pool page.
+        unsafe { std::ptr::copy_nonoverlapping(first.as_ptr().cast::<u8>(), p as *mut u8, len) };
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            crate::watch::tests::free(p);
+            return;
+        };
+        copy.update(p, len);
+        let widened = copy.widened(p as u64, len as u64, 1).expect("a widened view");
+        copy.writing(p, len, false);
+        let changed = [0x1111_1111, 0x2222_2222, 0x3333_3333];
+        // SAFETY: one 12-byte element of the mapped shadow, as a GPU write.
+        unsafe {
+            std::ptr::copy_nonoverlapping(changed.as_ptr().cast::<u8>(), copy.data.add(12), 12)
+        };
+        copy.keep_writes(p, len);
+        assert_eq!(
+            widened.read_host(16),
+            [
+                1000, 2000, 3000, 1, 0x1111_1111, 0x2222_2222, 0x3333_3333, 1, 1006, 2006, 3006,
+                1, 1009, 2009, 3009, 1,
+            ]
+        );
+        drop((widened, copy));
+        unregister(p, p as u64);
+        crate::watch::tests::free(p);
     }
 
     /// Pages shaders marked (`copy_back_marks`, `victory_shader::emit`
