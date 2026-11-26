@@ -93,6 +93,9 @@ pub(crate) struct Lowered {
     /// Whether the module contains the 32-lane half mask (`!31`).
     #[cfg(test)]
     pub has_half_wave_mask: bool,
+    /// Whether the module sets DXIL `ForceEarlyDepthStencil`.
+    #[cfg(test)]
+    pub early_depth_stencil: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -287,6 +290,10 @@ struct Lower<'a> {
     writes_uavs: bool,
     /// [`Lowered::heap`], [`Lowered::heap_writes`].
     heap: [bool; 2],
+    /// Any UAV handle (root, table, or heap-direct) created by the program.
+    uav_handle: bool,
+    /// Pixel: `dx.op.discard` was emitted.
+    has_discard: bool,
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
     /// Compute code that reads other lanes: thread ids follow the host
@@ -821,6 +828,8 @@ impl<'a> Lower<'a> {
             tail: vec![None; p.blocks.len()],
             writes_uavs,
             heap: [false; 2],
+            uav_handle: false,
+            has_discard: false,
             src0: None,
             console_lanes,
             halves,
@@ -1512,6 +1521,7 @@ impl<'a> Lower<'a> {
                         .map_err(|w| unsupported(offset, w))?;
                     self.s
                         .op(at, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
+                    self.has_discard = true;
                 }
                 if self.split_barriers.contains(&(b, i)) {
                     self.group_barrier();
@@ -1544,6 +1554,22 @@ impl<'a> Lower<'a> {
         let memory_writes = self.s.memory_dirty.is_some();
         let view_addresses = self.s.view_addresses.is_some();
         let cmp_samplers = self.s.cmp_samplers;
+        // Re-enable hardware Early-Z / TBDR HSR on opaque pixel shaders whose
+        // only UAV is VIctory's own read-mark bitmap (`mark_view_read`):
+        // without ForceEarlyDepthStencil, the injected UAV forces late-Z and
+        // shades occluded pixels behind closer geometry.
+        if self.s.pixel
+            && self.s.view_writes.is_some()
+            && self.s.root_uavs.is_empty()
+            && self.s.memory_dirty.is_none()
+            && !self.uav_handle
+            && !self.pops
+            && (self.s.flags & (flags::ROVS | flags::STENCIL_REF)) == 0
+            && !self.has_discard
+            && !self.s.outputs.iter().any(|o| matches!(o.kind, 14 | 17..=20))
+        {
+            self.s.flags |= flags::EARLY_DEPTH_STENCIL;
+        }
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
@@ -1582,6 +1608,8 @@ impl<'a> Lower<'a> {
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
+            #[cfg(test)]
+            early_depth_stencil: self.s.flags & flags::EARLY_DEPTH_STENCIL != 0,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -5757,6 +5785,9 @@ impl<'a> Lower<'a> {
         } else {
             props
         };
+        if !sampler && props.0 & 0x1000 != 0 {
+            self.uav_handle = true;
+        }
         // A descriptor from the resource heap itself: the host cannot tell
         // which slots the program reads, or writes through unordered access.
         if !sampler && self.is_heap_direct(src) {
