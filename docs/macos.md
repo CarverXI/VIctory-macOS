@@ -84,6 +84,12 @@ D3DMetal 4.0 beta 3 reports support for `R32G32B32_FLOAT`, `_UINT` and `_SINT` t
 
 D3DMetal 3.0, as bundled with CrossOver 26.2 and 26.3, returns zeros when a 24-bit depth texture (`R24G8_TYPELESS` or `D24_UNORM_S8_UINT`) is filled by a copy or copied out, while a clear reads back correctly in a shader (#33, with a standalone repro). 32-bit depth works. GPTK 4.0 beta 3 does not have this problem, and `a_depth_texture_written_through_unordered_views_reads_as_depth` passes there, so VIctory needs D3DMetal 4.0 or newer for depth copies. The test stays as it is on 3.0 so the failure remains visible.
 
+### R32G32B32 typed buffer UAVs, probed on D3DMetal 3.0 (26 November 2026)
+
+A synthetic probe on an Apple M1, macOS 27.0.1, CrossOver 26.3 (Wine 11.0) and its D3DMetal 3.0 characterized `R32G32B32_FLOAT`, `_UINT` and `_SINT` separately. `CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT)` returned success with `Support1=0x3`, including typed UAV support. Direct `CreateUnorderedAccessView` then logged `VK_ERROR_FORMAT_NOT_SUPPORTED` for the corresponding three-component Vulkan format and aborted in Metal's `MTLPixelFormatInvalid` alignment assertion, before returning. No typed store or raw readback ran. `ID3D12Device::CreateUnorderedAccessView` returns `void`, not an `HRESULT`, so a post-call result check cannot prevent this abort.
+
+Under Wine, `buffer_uav` now refuses true typed three-channel 32-bit UAVs before creation. Its caller installs the existing null `R32_UINT` buffer UAV, keeps no host resource and leaves the write mark clear. Raw and structured views are unchanged. On native hosts the code checks typed-UAV format support and device health before and after creation; a removed device is rejected without a kept descriptor or mark. The three serial Wine regressions pass without removing the device. GPTK 4.0 beta 3 was not available for this probe, so the Wine guard is conservative and also rejects these UAVs there. It will be revisited when 4.0 beta 3 is measured; until then do not narrow it.
+
 ## Route A: next steps
 
 The first playable route is the upstream Windows build running under Wine, with D3D12 going to Metal through Apple's D3DMetal. DXMT cannot be used because it covers D3D11 only. Rosetta 2 runs the title's x86-64 code and has supported AVX2 since macOS 15.
