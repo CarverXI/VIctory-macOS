@@ -206,3 +206,18 @@ So every submission now ends with a small list that copies the submission's numb
 ## The clwb write-back loops
 
 The title has eight loops that write cache lines back with `clwb`, which faults under Rosetta and costs an exception each time (#135). Under Rosetta, the same check that decides fault tracking, `victory` turns the `clwb` of each loop into a NOP when it loads the image. It patches only when it finds exactly eight loops and logs the number it found otherwise. `VICTORY_NOP_CLWB=0` leaves the loops alone and `VICTORY_NOP_CLWB=1` patches them where Rosetta is not detected.
+
+## Optional switches for slow storage, low memory and speed
+
+None of these changes the default. Each is read from the environment when the game starts, and all of them are tools for testers, so please post what you see on #131 or #135 when you try one.
+
+| Switch | What it does |
+| --- | --- |
+| `VICTORY_NO_HANG_WATCHDOG=1` | Turns off the title's hang watchdog. Once a second it crashes the title on purpose when a thread's heartbeat is too old or the main thread has not finished a frame for 30 checks, and a world load from slow storage outlasts that (#135). It applies only to the known Series build 1.0.2.1 and only where the original bytes match. |
+| `VICTORY_DSTORAGE_WORKERS=<n>` | Reads with `n` workers (1 to 256) instead of one per core, for storage with a long wait per read such as a network share. |
+| `VICTORY_EVICT_HEAP_UAV=1` | Lets textures viewed for unordered access in shader-visible heaps be given up until a shader writes through a heap, then made again. About 1.5 GB on an 8 GB Mac (#135). |
+| `VICTORY_SPILL_SHADERS=1` | Keeps shader containers on disk until they are translated. The title passes tens of thousands of containers and draws with a few hundred, and holding them all took about 700 MB of an 8 GB Mac (#135). |
+| `VICTORY_READ_STATS=1` | Logs the requests and bytes read from each file, every 30 seconds, for the 30 most read. It shows which files a slow share serves most, so you can copy those to fast local storage. |
+| `VICTORY_GPU_BUDGET_MB=<MB>` | Sets the budget that host textures are kept under, in place of the device's. |
+| `VICTORY_ALIAS_BUFFERS=1` | Under Rosetta with D3DMetal, points title buffers at the pages of a D3DMetal buffer with `mach_vm_remap`, so they need no host copies (#204). A probe at start-up falls back to the copies if the remap does not work. It has only synthetic tests so far, so it needs a run in the game. |
+| `VICTORY_WINDOW_SECONDARY=1` | Opens the game window on the only non-primary display. |
