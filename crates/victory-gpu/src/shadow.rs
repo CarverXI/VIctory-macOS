@@ -787,14 +787,24 @@ impl Shadow {
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
-            // gaps whole cost ~1 s per frame). Under them nothing: what the
-            // title wrote there is not known.
+            // gaps whole cost ~1 s per frame). Under them, the title's bytes
+            // as well, as nothing says what it wrote since: a submission
+            // waits for the one before it, so none of this submission's
+            // shaders has run yet, and a constant the title wrote there
+            // would stay stale for the whole submission. The same bytes go
+            // into the snapshot `writing` took, so copy-back tells the
+            // shader's write from them.
             busy.sort_unstable();
             let (mut at, mut bytes) = (from, 0);
             for (a, e) in busy {
                 let (a, e) = (a.max(from), e.min(to));
                 if a > at {
                     bytes += self.update_untracked(at, a);
+                }
+                if e > a.max(at) {
+                    let (a, e) = (a.max(at), e);
+                    bytes += self.update_untracked(a, e);
+                    self.sync_snapshot(a, e);
                 }
                 at = at.max(e);
             }
@@ -833,15 +843,8 @@ impl Shadow {
         let start = self.start as usize;
         let mut before = busy.then(|| self.before.lock().unwrap_or_else(|e| e.into_inner()));
         let mut sync_before = |a: usize, b: usize| {
-            let Some(before) = &mut before else { return };
-            let (a, b) = (a - start, b - start);
-            for (at, bytes) in before.0.iter_mut() {
-                let (s, e) = ((*at).max(a), (*at + bytes.len()).min(b));
-                if s < e {
-                    // SAFETY: inside the mapping.
-                    let host = unsafe { std::slice::from_raw_parts(self.data.add(s), e - s) };
-                    bytes[s - *at..e - *at].copy_from_slice(host);
-                }
+            if let Some(before) = &mut before {
+                self.sync_snapshot_in(before, a, b);
             }
         };
         let mut copied = 0;
@@ -880,6 +883,26 @@ impl Shadow {
             add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
         }
         copied
+    }
+
+    /// Puts the copy's bytes of `[a, b)` (title addresses), just updated,
+    /// into the snapshot a submission that is writing took.
+    fn sync_snapshot(&self, a: usize, b: usize) {
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        self.sync_snapshot_in(&mut before, a, b);
+    }
+
+    fn sync_snapshot_in(&self, before: &mut Snapshot, a: usize, b: usize) {
+        let start = self.start as usize;
+        let (a, b) = (a - start, b - start);
+        for (at, bytes) in before.0.iter_mut() {
+            let (s, e) = ((*at).max(a), (*at + bytes.len()).min(b));
+            if s < e {
+                // SAFETY: inside the mapping.
+                let host = unsafe { std::slice::from_raw_parts(self.data.add(s), e - s) };
+                bytes[s - *at..e - *at].copy_from_slice(host);
+            }
+        }
     }
 
     /// [`Shadow::update`] of untracked `[from, to)` (inside the buffer).

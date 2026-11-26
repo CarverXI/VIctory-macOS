@@ -316,7 +316,11 @@ fn create() -> windows::core::Result<Host> {
                 size_of_val(&options) as u32,
             )
             .is_ok()
-            && options.DepthBoundsTestSupported.as_bool();
+            && options.DepthBoundsTestSupported.as_bool()
+            // D3DMetal reports the test and does not apply it (Metal has
+            // none): bounds that should reject a draw leave it whole, as when
+            // the host has no test, and the plain pipeline states are safer.
+            && !crate::shader_cache::under_wine();
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();

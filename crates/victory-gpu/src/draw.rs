@@ -2136,6 +2136,20 @@ void main() {
         Param::Constants { register: 0, count: 3 },
     ];
 
+    /// Whether the host's HLSL compiler builds the marked write shader. Wine's
+    /// (vkd3d-shader) fails on its interlocked write to the bitmap, so these
+    /// tests skip there.
+    fn marked_writes_build() -> bool {
+        match crate::compute::pipeline(MARKED_WRITE_SOURCE, s!("root"), 0, MARKED_WRITES) {
+            Ok(_) => true,
+            Err(e) if crate::shader_cache::under_wine() => {
+                eprintln!("skipped: Wine's HLSL compiler cannot build the marked write shader ({e})");
+                false
+            }
+            Err(e) => panic!("the marked write shader does not build: {e}"),
+        }
+    }
+
     fn buffer_at_address(address: u64, bytes: u64) -> This {
         let desc: [u32; 14] = [
             1,
@@ -2235,6 +2249,9 @@ void main() {
     /// guest bytes intact.
     #[test]
     fn marked_subpage_uav_writes_copy_back_and_keep_neighbor_bytes() {
+        if !marked_writes_build() {
+            return;
+        }
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -2276,6 +2293,9 @@ void main() {
     /// `copy_back_marks` 3-way merges GPU, CPU, and pre-existing bytes.
     #[test]
     fn marked_subpage_uav_and_cpu_disjoint_write_three_way_merge() {
+        if !marked_writes_build() {
+            return;
+        }
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -2318,6 +2338,9 @@ void main() {
     /// boundary without disturbing surrounding title memory.
     #[test]
     fn marked_subpage_uav_unaligned_and_cross_page_shadow_bounds() {
+        if !marked_writes_build() {
+            return;
+        }
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -2389,6 +2412,9 @@ void main() {
     /// same 64 KiB page within one command list all land in title memory.
     #[test]
     fn marked_subpage_uavs_after_copy_in_same_list() {
+        if !marked_writes_build() {
+            return;
+        }
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -2434,6 +2460,9 @@ void main() {
     /// their refresh to enclosing 64 KiB page bounds.
     #[test]
     fn marked_unaligned_root_uav_and_bindless_subpage_refresh() {
+        if !marked_writes_build() {
+            return;
+        }
         let Some(host) = crate::host::host() else {
             return;
         };
