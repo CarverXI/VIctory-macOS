@@ -793,12 +793,14 @@ impl HostHeap {
         Some(text)
     }
 
-    /// Slots viewing one of the host textures `textures` (raw pointers),
+    /// Title slots viewing one of the host textures `textures` (raw pointers),
     /// which are given up: each gets a null view of its kind and holds the
     /// texture no more (retired until the running submission has run), its
     /// record stays noted so heap syncs leave it, and the next draw reading
     /// it through a table or shader reading it through the heap (its read
-    /// mark, cleared) makes it again.
+    /// mark, cleared) makes it again. Slots past `count` stay made: recorded
+    /// lists and host copies already name them, and there is no title record
+    /// from which to make them again.
     /// The slots are found by a walk of the heap, once per pass that gives
     /// textures up: a map of each texture's slots, kept at every slot the
     /// title rewrote, cost ~25 us a slot (a texture viewed in thousands of
@@ -808,7 +810,11 @@ impl HostHeap {
         let slots: Vec<u32> = {
             let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
             kept.iter()
-                .filter(|(_, k)| k.1.is_none() && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize)))
+                .filter(|&(i, k)| {
+                    i < self.count as usize
+                        && k.1.is_none()
+                        && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize))
+                })
                 .map(|(i, _)| i as u32)
                 .collect()
         };

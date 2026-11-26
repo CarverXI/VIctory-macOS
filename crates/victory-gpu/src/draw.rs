@@ -2531,6 +2531,98 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(crate::texture::uploads(object), 1, "uploaded into the new one");
     }
 
+    /// A dynamic texture descriptor a recorded list names stays made through
+    /// an eviction pass: unlike a title slot, it has no descriptor record
+    /// from which to make it again.
+    #[test]
+    fn a_recorded_list_keeps_its_dynamic_texture_descriptor() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let address = crate::watch::tests::pool(1) as u64;
+        let object = texture_at_address(address, &texture_words(64, 64, 42, 0x100, 4));
+        let view = View::Unordered(object as usize, 0, Some([42, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
+
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let slots = crate::descriptor::heap(heap).host().expect("a host view heap");
+        let dynamic = slots.dynamic(1).expect("a dynamic slot");
+        assert!(dynamic >= slots.count(), "past the title's recorded slots");
+        slots.make_at(dynamic, &view);
+        assert!(slots.kept(dynamic), "made for the list");
+        let texture = crate::resource::made_copy(object).expect("its host texture");
+        let raw = windows::core::Interface::as_raw(&texture.texture) as usize;
+
+        // A clear through the dynamic descriptor, then a copy of what it left.
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut total = 0;
+        // SAFETY: outputs for the texture's one subresource.
+        unsafe {
+            let desc = texture.texture.GetDesc();
+            host.device.GetCopyableFootprints(&desc, 0, 1, 0, Some(&mut footprint), None, None, Some(&mut total));
+        }
+        let (readback, data) = host.shared_buffer(total).unwrap();
+        let list = host.new_list().unwrap();
+        readable(&list, &used(ResourceType::Uav), &view, false);
+        let at = host.cpu_view();
+        let resource = crate::descriptor::host::make_view(&view, at).expect("a matching CPU descriptor");
+        let values = [0x1122_3344, 0x5566_7788, 0x99aa_bbcc, 0xddee_ff00];
+        // SAFETY: an open list and live objects; the clear names the dynamic slot.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(slots.heap.clone())]);
+            list.list.ClearUnorderedAccessViewUint(slots.gpu(dynamic), at, &resource, &values, &[]);
+        }
+        crate::list::ensure_state(&list, object, 0x800);
+        // SAFETY: borrowed resources; the copy is recorded before they are released.
+        unsafe {
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&readback),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&texture.texture),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+        }
+        list.close();
+
+        // Force the eviction pass directly: an unordered texture is not a
+        // normal candidate, but the dynamic-slot rule applies to every view.
+        crate::descriptor::evict(&std::collections::HashSet::from([raw]));
+        assert!(slots.kept(dynamic), "the recorded list's descriptor is retained");
+        assert_eq!(slots.textures_at(&[dynamic]), [raw], "still views the held texture");
+
+        host.execute(&[&list]);
+        // SAFETY: inside the mapped readback, at the first and last texels.
+        unsafe {
+            let word = |x: u32, y: u32| {
+                (data.add(y as usize * footprint.Footprint.RowPitch as usize + x as usize * 4) as *const u32).read()
+            };
+            assert_eq!(word(0, 0), values[0], "the recorded clear used the descriptor");
+            assert_eq!(word(63, 63), values[0], "the whole texture was cleared");
+        }
+
+        slots.make_null(dynamic);
+        slots.release(dynamic, 1);
+        drop(list);
+        assert_eq!(
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(heap, 0x10)(heap),
+            0
+        );
+        assert_eq!(
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(object, 0x10)(object),
+            0
+        );
+        drop(texture);
+        crate::watch::tests::free(address as usize);
+    }
+
     /// Textures brought up in one submission share staging space (parts
     /// of one upload buffer): each reads its own bytes.
     #[test]
