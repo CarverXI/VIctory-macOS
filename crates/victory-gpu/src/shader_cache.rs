@@ -146,7 +146,13 @@ pub(crate) fn under_wine() -> bool {
 /// [`build`] for translations with host workarounds (atomic locks, bias
 /// as gradients, narrow waves): their own cache entries, one per
 /// combination.
-fn options_build(locks: bool, bias: bool, narrow: bool) -> &'static [u8; 32] {
+pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'static [u8; 32] {
+    let locks = options.atomic_locks;
+    let bias = options.bias_as_gradients;
+    let narrow = options.narrow_waves;
+    if !locks && !bias && !narrow {
+        return build();
+    }
     static BUILDS: [OnceLock<[u8; 32]>; 8] = [const { OnceLock::new() }; 8];
     let n = usize::from(locks) | usize::from(bias) << 1 | usize::from(narrow) << 2;
     BUILDS[n].get_or_init(|| {
@@ -186,15 +192,7 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     let options = runtime_options();
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
-    let build = if options.atomic_locks || options.bias_as_gradients || options.narrow_waves {
-        options_build(
-            options.atomic_locks,
-            options.bias_as_gradients,
-            options.narrow_waves,
-        )
-    } else {
-        build()
-    };
+    let build = translation_build(options);
     match CACHE.get() {
         Some(cache) => cached(cache, build, container, translate),
         None => (translate(container), false),

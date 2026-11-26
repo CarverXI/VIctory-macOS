@@ -258,14 +258,17 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
 /// names its pipelines (the translation, as the shader cache keys it; the
 /// host descriptions).
 fn tag(blob: &[u8]) -> String {
-    let limit = victory_shader::emit::loop_limit().to_le_bytes();
-    let translator = victory_shader::SOURCE_HASH.as_bytes();
+    use crate::shader_cache;
+    let translation = shader_cache::translation_build(shader_cache::runtime_options());
+    tag_with_settings(blob, translation, super::link_mesh_outputs())
+}
+
+fn tag_with_settings(blob: &[u8], translation: &[u8; 32], link_mesh_outputs: bool) -> String {
     let mut h = blake3::Hasher::new();
     for part in [
         blob,
-        translator,
-        include_bytes!("../shader_cache.rs"),
-        &limit,
+        translation,
+        &[u8::from(link_mesh_outputs)],
         include_bytes!("host.rs"),
         include_bytes!("library.rs"),
     ] {
@@ -640,6 +643,43 @@ mod tests {
         assert_eq!(listed(saved.as_bytes(), &tag(b"library")), keys);
         assert!(listed(saved.as_bytes(), &tag(b"library2")).is_empty());
         assert!(listed(b"", &tag(b"library")).is_empty());
+    }
+
+    #[test]
+    fn changing_translation_settings_invalidates_the_prebuilt_list() {
+        use crate::shader_cache::{runtime_options, translation_build};
+
+        let options = runtime_options();
+        let current = |locks, bias, narrow, link| {
+            let options = victory_shader::emit::Options {
+                atomic_locks: locks,
+                bias_as_gradients: bias,
+                narrow_waves: narrow,
+                ..options
+            };
+            tag_with_settings(b"library", translation_build(options), link)
+        };
+        let keys = HashSet::from(["pipeline".to_owned()]);
+        let original = current(false, false, false, false);
+        let saved = list(&original, &keys);
+        assert_eq!(listed(saved.as_bytes(), &original), keys);
+        for changed in [
+            current(true, false, false, false),
+            current(false, true, false, false),
+            current(false, false, true, false),
+            current(false, false, false, true),
+        ] {
+            assert!(listed(saved.as_bytes(), &changed).is_empty());
+        }
+        assert_eq!(
+            tag(b"library"),
+            current(
+                options.atomic_locks,
+                options.bias_as_gradients,
+                options.narrow_waves,
+                super::super::link_mesh_outputs(),
+            )
+        );
     }
 
     #[test]
