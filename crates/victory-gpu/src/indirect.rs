@@ -59,7 +59,7 @@ fn clamp() -> Option<&'static Clamp> {
 
 fn make() -> windows::core::Result<Clamp> {
     #[cfg(victory_dxc_clamp)]
-    match from_bytes(include_bytes!(concat!(env!("OUT_DIR"), "/indirect-clamp.dxil"))) {
+    match precompiled() {
         Ok(clamp) => {
             tracing::info!("argument clamp: using precompiled 64-thread shader");
             return Ok(clamp);
@@ -70,6 +70,22 @@ fn make() -> windows::core::Result<Clamp> {
         tracing::info!(error = %e, "argument clamp: building the one-thread form");
         make_words()
     })
+}
+
+/// The clamp compiled by DXC at build time. D3DMetal finds a shader by the
+/// `HASH` part of its container, and DXC leaves that and the container
+/// digest as zeros when it cannot find `dxil.dll` to sign with, which would
+/// make this shader share a cache entry with every other unsigned one (issue
+/// #4). So both are checked here and set when they are zero.
+#[cfg(victory_dxc_clamp)]
+fn precompiled() -> windows::core::Result<Clamp> {
+    let mut bytes = include_bytes!(concat!(env!("OUT_DIR"), "/indirect-clamp.dxil")).to_vec();
+    match victory_shader::emit::sign_container(&mut bytes) {
+        Ok(true) => tracing::info!("argument clamp: the compiled shader was unsigned, its digests are set"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(error = %e, "argument clamp: could not check the compiled shader's digests"),
+    }
+    from_bytes(&bytes)
 }
 
 /// The clamp for Wine's HLSL compiler (vkd3d-shader), which has no `Load`
@@ -232,9 +248,18 @@ pub(crate) fn bound(
     (kind, stride, records): (u32, u32, u32),
     count: Option<u64>,
 ) -> Option<ID3D12Resource> {
-    let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
-        return None;
-    };
+    bound_with(clamp()?, list, gpu, (kind, stride, records), count)
+}
+
+/// [`bound`] with a given clamp.
+fn bound_with(
+    c: &Clamp,
+    list: &HostList,
+    gpu: u64,
+    (kind, stride, records): (u32, u32, u32),
+    count: Option<u64>,
+) -> Option<ID3D12Resource> {
+    let budget = list.budget()?;
     if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
         return None;
     }
@@ -316,13 +341,61 @@ mod tests {
         assert!(super::clamp().is_some());
     }
 
+    /// Every word the clamp `c` writes for `records` records of `kind` made
+    /// from `seed` by a small generator, in one list with no count buffer.
+    /// `None` without a host GPU.
+    #[cfg(victory_dxc_clamp)]
+    fn clamp_all(c: &super::Clamp, kind: u32, seed: u32, records: u32) -> Option<Vec<u32>> {
+        let host = super::host()?;
+        let per = match kind {
+            0 => 4,
+            1 => 5,
+            _ => 3,
+        };
+        let all = per * records as usize;
+        let (buffer, data) = host.shared_buffer(all as u64 * 4 + 16).unwrap();
+        let data = data.cast::<u32>();
+        let list = host.new_list().unwrap();
+        let mut state = seed;
+        // SAFETY: our mapped buffer, written before the list runs and read
+        // after it has; a live buffer.
+        unsafe {
+            for at in 0..all {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                // Mostly small values, now and then a wild one.
+                let word = if state >> 28 == 0 { state } else { (state >> 8) % 9000 };
+                data.add(at).write_volatile(word);
+            }
+            let spec = (kind, per as u32 * 4, records);
+            let out = super::bound_with(c, &list, buffer.GetGPUVirtualAddress(), spec, None).unwrap();
+            super::done(&list, &out);
+            list.close();
+            host.execute(&[&list]);
+            let mut out_data = std::ptr::null_mut();
+            out.Map(0, None, Some(&mut out_data)).unwrap();
+            Some((0..all).map(|i| out_data.cast::<u32>().add(i).read_volatile()).collect())
+        }
+    }
+
+    /// The precompiled clamp is the one in use when it builds, and it writes
+    /// what the clamp compiled at run time writes for the same records of
+    /// every kind.
     #[cfg(victory_dxc_clamp)]
     #[test]
     #[ignore = "requires a hardware D3D12 queue and the build-time DXC shader"]
     fn hardware_uses_precompiled_clamp() {
-        let shader = include_bytes!(concat!(env!("OUT_DIR"), "/indirect-clamp.dxil"));
-        super::from_bytes(shader).expect("create pipeline from the compiled clamp");
+        if super::host().is_none() {
+            return; // no host GPU here
+        }
+        let precompiled = super::precompiled().expect("create pipeline from the compiled clamp");
+        assert!(!precompiled.words);
         assert!(!super::clamp().expect("argument clamp").words);
+        let reference = super::make_fxc().or_else(|_| super::make_words()).expect("the existing clamp");
+        for (kind, seed, records) in [(0, 1, 200), (1, 2, 200), (2, 3, 130), (10, 4, 70), (0, 5, 3)] {
+            let new = clamp_all(&precompiled, kind, seed, records).unwrap();
+            let old = clamp_all(&reference, kind, seed, records).unwrap();
+            assert_eq!(new, old, "kind {kind}, {records} records");
+        }
     }
 
     /// Clamps `records` records of `kind`, filled by repeating `words`,

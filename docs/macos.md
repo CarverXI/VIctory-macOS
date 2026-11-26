@@ -72,7 +72,7 @@ cargo build --locked --target x86_64-pc-windows-gnullvm -p victory
 tools/macos/test-wine.sh -p victory-gpu --lib hardware_uses_precompiled_clamp -- --ignored
 ```
 
-Keep the compiler and its companion DLLs together. On success the runtime logs `argument clamp: using precompiled 64-thread shader`. Without a configured compiler, or if the device rejects the compiled shader, the existing runtime compilation paths remain available.
+Keep the compiler and its companion DLLs together. DXC signs its output (the digest in the container header and the digest in the `HASH` part, which D3DMetal uses to find compiled shaders) only when `dxil.dll` sits next to `dxc.exe`. Without it the output is unsigned, with both digests zero, and zero digests once made unrelated shaders run each other's code (#4). The runtime therefore checks the compiled clamp when it loads it and sets both digests from the program if they are zero, and it logs when it had to. CI never builds this path, because it never sets `VICTORY_HELPER_DXC`; the ignored test runs the precompiled clamp and the runtime-compiled one on the same records and compares every word they write. On success the runtime logs `argument clamp: using precompiled 64-thread shader`. Without a configured compiler, or if the device rejects the compiled shader, the existing runtime compilation paths remain available.
 
 D3DMetal has no Metal format for `R10G10B10_XR_BIAS_A2_UNORM`. It refuses any castable format list that names it, and creating a texture in that format stops the process in Metal's validation. `castable` leaves it out, so 4-byte colour textures of one memory share one host texture under D3DMetal too.
 

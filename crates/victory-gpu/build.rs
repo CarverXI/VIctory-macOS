@@ -1,5 +1,8 @@
 use std::{env, path::PathBuf, process::Command};
 
+// Only a build with VICTORY_HELPER_DXC set runs the compiler. CI never sets it,
+// so the DXC path is not built or tested there: it is checked by hand with the
+// ignored test `hardware_uses_precompiled_clamp` (see docs/macos.md).
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(victory_dxc_clamp)");
     println!("cargo:rerun-if-env-changed=VICTORY_HELPER_DXC");
