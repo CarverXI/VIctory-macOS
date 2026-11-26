@@ -3389,7 +3389,9 @@ impl Host {
         };
         // What is presented, whenever it changes: the title's texture in its
         // host format, and the swap chain format it is copied into.
-        static SHOWN: Mutex<Option<((u32, u32, i32), (u32, u32, i32))>> = Mutex::new(None);
+        /// Width, height and format.
+        type Shape = (u32, u32, i32);
+        static SHOWN: Mutex<Option<(Shape, Shape)>> = Mutex::new(None);
         let shown = Some(((native.0, native.1, desc.Format.0), (width, height, format.0)));
         let mut last = SHOWN.lock().unwrap_or_else(|e| e.into_inner());
         if *last != shown {
@@ -3407,6 +3409,10 @@ impl Host {
             );
         }
         drop(last);
+        // This also covers a swap chain created at the capped size when the
+        // blend pass later cannot be built: width, height and format were reset
+        // to the title texture's own above, so the buffers are resized to match
+        // before the direct copy.
         if (p.width, p.height, p.format) != (width, height, format) {
             let resized = retry.attempt(Instant::now(), || {
                 // SAFETY: no back buffer is held; every submission was waited for.

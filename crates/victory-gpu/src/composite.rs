@@ -356,7 +356,7 @@ mod tests {
         let (w, h) = fit_output(1920, 1080, (1280, 720));
         let stride = (w * 4).next_multiple_of(256);
         let picture_pixel = |x: u32, y: u32| [x as u8, y as u8, 37, 77];
-        let overlay_pixel = |x: u32, y: u32| [21, x as u8, y as u8, if (x + y) % 3 == 0 { 255 } else { 0 }];
+        let overlay_pixel = |x: u32, y: u32| [21, x as u8, y as u8, if (x + y).is_multiple_of(3) { 255 } else { 0 }];
         let upload = host.new_list().unwrap();
         let mut keep = Vec::new();
         let picture = texture(1920, 1080, &(0..1920 * 1080).map(|n| picture_pixel(n % 1920, n / 1920)).collect::<Vec<_>>(), &upload.list, &mut keep);
