@@ -17,6 +17,7 @@ victory-pipeline.workspace = true
 victory-shader = { workspace = true, features = ["host"] }
 
 [dev-dependencies]
+tracing-subscriber.workspace = true
 tempfile.workspace = true
 
 [features]
