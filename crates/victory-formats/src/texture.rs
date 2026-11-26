@@ -775,6 +775,47 @@ impl Layout {
     }
 }
 
+/// The runs of bytes that differ between `kept`, the bytes a texture's
+/// memory last compared equal, and `fresh`, a chunk of it just read (`at`
+/// the chunk's offset in the memory), walked byte by byte: added to
+/// `runs` and copied into `kept`, which ends the memory's. This is the
+/// compare with the fast path off — every chunk walked, as the compare
+/// was before the slice guard ([`changed_runs`]) — kept public for the
+/// bench that times both.
+pub fn walk_changed(at: usize, kept: &mut [u8], fresh: &[u8], runs: &mut Vec<(usize, usize)>) {
+    let n = fresh.len();
+    let mut i = 0;
+    while i < n {
+        if kept[i] != fresh[i] {
+            let first = i;
+            while i < n && kept[i] != fresh[i] {
+                i += 1;
+            }
+            runs.push((at + first, i - first));
+            kept[first..i].copy_from_slice(&fresh[first..i]);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// The compare core of an untracked texture refresh: the runs of bytes
+/// that differ between `kept`, the bytes the memory last compared equal,
+/// and `fresh`, a chunk of it just read (`at` the chunk's offset in the
+/// memory), added to `runs` and copied into `kept`, which is kept the
+/// memory's. A chunk that compares slice-equal holds no differing byte
+/// and is not walked: nothing tracks the memory's writes under Rosetta
+/// (VIctory-macOS issue #1), so a refresh reads it whole and compares,
+/// and almost every chunk of almost every refresh is equal. The walk
+/// itself is [`walk_changed`], so the two shapes cannot drift.
+pub fn changed_runs(at: usize, kept: &mut [u8], fresh: &[u8], runs: &mut Vec<(usize, usize)>) {
+    if *kept == *fresh {
+        // The usual case: one slice comparison, no byte walk.
+        return;
+    }
+    walk_changed(at, kept, fresh, runs);
+}
+
 enum Buffers<'a> {
     Detile {
         tiled: &'a [u8],
@@ -989,6 +1030,34 @@ mod tests {
             samples: 1,
             swizzle,
         }
+    }
+
+    /// The compare core of an untracked refresh: a chunk that compares
+    /// equal reports nothing, a differing one the runs of its differing
+    /// bytes at their offsets in the memory, and `kept` ends the
+    /// memory's; the walk behind the fast path answers the same.
+    #[test]
+    fn changed_runs_report_and_keep_the_differing_bytes() {
+        let memory = [7u8; 100];
+        let mut kept = memory;
+        let mut runs = Vec::new();
+        changed_runs(0, &mut kept, &memory, &mut runs);
+        assert!(runs.is_empty());
+        assert_eq!(kept, memory);
+        // A chunk read at offset 40 with two differing bytes: their
+        // runs, at the memory's offsets, and kept becomes the memory's.
+        let mut fresh = memory;
+        fresh[43] = 9;
+        fresh[70] = 5;
+        changed_runs(40, &mut kept[40..], &fresh[40..], &mut runs);
+        assert_eq!(runs, vec![(43, 1), (70, 1)]);
+        assert_eq!(kept, fresh);
+        // The walk with the fast path off answers the same.
+        let mut walked = memory;
+        let mut walk_runs = Vec::new();
+        walk_changed(40, &mut walked[40..], &fresh[40..], &mut walk_runs);
+        assert_eq!(walk_runs, runs);
+        assert_eq!(walked, fresh);
     }
 
     /// Active bytes copied per second on synthetic surfaces:
