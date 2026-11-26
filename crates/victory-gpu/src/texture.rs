@@ -795,7 +795,11 @@ thread_local! {
 ///
 /// The memory is read a `scratch` at a time and compared with `last.read`
 /// there, so memory that did not change is read once, as comparing it alone
-/// reads it, and not copied. The answer is the runs of bytes that differ
+/// reads it, and not copied. The compare itself is
+/// `victory_formats::texture::changed_runs`: a chunk that compares
+/// slice-equal is answered so without a walk — the byte walk runs only
+/// in the chunks that differ, almost every chunk of almost every
+/// refresh comparing equal. The answer is the runs of bytes that differ
 /// (they need not be maximal across the chunks), kept up to date in
 /// `last.read`; a memory not read whole yet is one run of everything. A
 /// read that fails part way leaves `last.read` half new: it stays invalid
@@ -829,24 +833,7 @@ fn read_changed(
             return None;
         }
         let kept = &mut last.read[at..at + n];
-        if *kept == *chunk {
-            // The usual case: one slice comparison, no byte walk.
-            at += n;
-            continue;
-        }
-        let mut i = 0;
-        while i < n {
-            if kept[i] != chunk[i] {
-                let first = i;
-                while i < n && kept[i] != chunk[i] {
-                    i += 1;
-                }
-                runs.push((at + first, i - first));
-                kept[first..i].copy_from_slice(&chunk[first..i]);
-            } else {
-                i += 1;
-            }
-        }
+        victory_formats::texture::changed_runs(at, kept, chunk, &mut runs);
         at += n;
     }
     Some(runs)
