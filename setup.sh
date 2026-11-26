@@ -75,7 +75,9 @@ fi
 if [[ -d $WINE_DIR/lib/external/D3DMetal.framework ]]; then
   say "D3DMetal already added"
 else
-  dmg="${GPTK_DMG:-$(ls -t "$HOME"/Downloads/Game_Porting_Toolkit*.dmg 2> /dev/null | head -n 1)}"
+  # (N) keeps zsh quiet when nothing matches, (om) puts the newest first.
+  downloads=("$HOME"/Downloads/Game_Porting_Toolkit*.dmg(Nom))
+  dmg="${GPTK_DMG:-${downloads[1]:-}}"
   if [[ -z $dmg || ! -f $dmg ]]; then
     print
     print -P "%F{yellow}One manual step is left.%f Apple only gives D3DMetal to people who sign in, so you have to download it yourself:"
@@ -116,9 +118,13 @@ fi
 say "building VIctory"
 cargo build --quiet --release -p victory --target x86_64-pc-windows-gnullvm
 [[ -f victory.toml ]] || cp victory.example.toml victory.toml
-tools/macos/victory.sh config > /dev/null 2>&1 || die "VIctory did not start under Wine. Run tools/macos/victory.sh config to see why"
+# --version starts VIctory under Wine without reading victory.toml, whose
+# example game_dir does not exist yet, so a fresh setup does not fail here.
+tools/macos/victory.sh --version > /dev/null 2>&1 || die "VIctory did not start under Wine. Run tools/macos/victory.sh --version to see why"
 
 print
 print -P "%F{green}Setup finished.%f"
-print "Put your own copy of the game in a folder, set game_dir in victory.toml, and start it with:"
+print "Put your own copy of the game in a folder, set game_dir in victory.toml, check it with"
+print "  tools/macos/victory.sh config"
+print "and start it with:"
 print "  tools/macos/victory.sh run --execute <the game's executable>"
