@@ -2775,7 +2775,7 @@ void main(uint3 id : SV_DispatchThreadID) {{
         unsafe { std::ptr::copy_nonoverlapping(initial.as_ptr().cast::<u8>(), src_bytes, 48) };
 
         let null = std::ptr::null();
-        let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+        let heap_desc: [u32; 8] = [0, 5, 1, 0, 0, 0, 0, 0];
         let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
         let mut heap = null;
         assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
@@ -2789,6 +2789,8 @@ void main(uint3 id : SV_DispatchThreadID) {{
         crate::descriptor::create_uav(null, src, null, &source_raw, title_heap.start);
         crate::descriptor::create_srv(null, src, &srv_words, title_heap.start + 32);
         crate::descriptor::create_uav(null, dst, null, &output_raw, title_heap.start + 64);
+        let first_result = [39, 1, 4, 0, 4, 0, 0, 0, 1, 0];
+        crate::descriptor::create_uav(null, dst, null, &first_result, title_heap.start + 128);
         let heap_host = title_heap.host().expect("a host view heap");
         assert!(heap_host.made(0) && heap_host.kept(0), "the source UAV is made");
         assert!(heap_host.made(1) && heap_host.kept(1), "the widened SRV is made");
@@ -2856,7 +2858,7 @@ void main() { dst.Store4(0, asuint(src[1])); }
         unsafe {
             list.list.SetComputeRootSignature(&reader.0);
             list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(3));
-            list.list.SetComputeRootDescriptorTable(1, heap_host.gpu(2));
+            list.list.SetComputeRootDescriptorTable(1, heap_host.gpu(4));
             list.list.SetPipelineState(&reader.1);
             list.list.Dispatch(1, 1, 1);
         }
@@ -2896,7 +2898,16 @@ void main() { dst.Store4(0, asuint(src[1])); }
             "the second raw UAV write reaches its shadow"
         );
         let out = crate::shadow::find(dst_bytes as u64, 256).expect("the output copy");
-        assert_eq!(out.read_host(dst_bytes as u64, 4), [1003, 2003, 4, 1]);
+        assert_eq!(
+            out.read_host(dst_bytes as u64 + 16, 4),
+            [1003, 2003, 9, 1],
+            "first write"
+        );
+        assert_eq!(
+            out.read_host(dst_bytes as u64, 4),
+            [1003, 2003, 4, 1],
+            "second write"
+        );
     }
 
     /// A heap-writing draw is sampled at its barrier. A widened view made
