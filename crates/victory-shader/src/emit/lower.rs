@@ -1370,7 +1370,12 @@ impl<'a> Lower<'a> {
         {
             return Err("a wave reduction in a mesh shader");
         }
-        self.same_half(ACROSS)?;
+        // An active reduction substitutes its identity for inactive lanes.
+        // If the group fits one host wave, the absent upper half contributes
+        // only identities and the host wave contains all participating lanes.
+        if prefix.is_some() || !self.one_host_wave() {
+            self.same_half(ACROSS)?;
+        }
         let c = self.cur;
         let &m = self
             .x
@@ -2051,7 +2056,12 @@ impl<'a> Lower<'a> {
                     Some(&b) if b == self.cur_ir => self.cur,
                     Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
                 };
-                self.same_half("a lane mask read as data (wave64 on a 32-lane host)")?;
+                // If the whole group fits, there are no dispatched lanes in
+                // the upper half and the host ballot covers every active lane.
+                let single_half = self.halves && self.one_host_wave();
+                if !single_half {
+                    self.same_half("a lane mask read as data (wave64 on a 32-lane host)")?;
+                }
                 if !self.balloting.insert(lo) {
                     return Err("a lane mask whose lanes depend on its own value");
                 }
@@ -2064,7 +2074,13 @@ impl<'a> Lower<'a> {
                     .s
                     .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
                 self.s.flags |= flags::WAVE_OPS;
-                let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                let low_word = self.s.m.extract(at, r, 0);
+                let high_word = if single_half {
+                    self.s.m.i32(0)
+                } else {
+                    self.s.m.extract(at, r, 1)
+                };
+                let xy = (low_word, high_word);
                 self.ballots.insert(lo, xy);
                 xy
             }
