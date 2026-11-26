@@ -106,7 +106,31 @@ fn append_to_log(text: &str) {
     let _ = append_record(file, text);
 }
 
+/// Held while a record is appended. Wine appends at the size `fstat` gives
+/// and `pwrite`s there, so two threads appending at once can write over each
+/// other's records. A bounded spin stands in for a lock: a thread that
+/// faults while holding it delays a report but cannot stop it.
+static APPENDING: AtomicBool = AtomicBool::new(false);
+const APPEND_TRIES: u32 = 1 << 16;
+
 fn append_record(file: &std::path::Path, text: &str) -> std::io::Result<()> {
+    let held = (0..APPEND_TRIES).any(|_| {
+        let won = APPENDING
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok();
+        if !won {
+            std::thread::yield_now();
+        }
+        won
+    });
+    let appended = append_once(file, text);
+    if held {
+        APPENDING.store(false, Ordering::Release);
+    }
+    appended
+}
+
+fn append_once(file: &std::path::Path, text: &str) -> std::io::Result<()> {
     use std::io::{Error, ErrorKind, Write};
 
     let now = std::time::SystemTime::now()
