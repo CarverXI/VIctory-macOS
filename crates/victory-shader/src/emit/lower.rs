@@ -621,7 +621,10 @@ impl<'a> Lower<'a> {
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
                     || n.starts_with("v_mbcnt")
-                    || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+                    || matches!(
+                        n,
+                        "v_readlane_b32" | "v_writelane_b32" | "v_permlanex16_b32"
+                    )
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
             }) || {
@@ -6732,6 +6735,43 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
             }
+            "v_permlanex16_b32" => {
+                self.cross_lane(false)?;
+                let (value, low, high) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let lane = self.lane_index();
+                let [two, seven, eight, fifteen, sixteen, row_mask] =
+                    [2, 7, 8, 15, 16, !15].map(|n| self.s.m.i32(n));
+                // The nibble for this lane comes from src1 at offsets 0..7
+                // and src2 at offsets 8..15. It indexes the other row of 16
+                // in the same 32-lane half of the wave.
+                let in_row = self.s.m.bin(c, Bin::And, lane, fifteen);
+                let hi = self.s.m.cmp(c, pred::IUGE, in_row, eight);
+                let selectors = self.s.m.select(c, hi, high, low);
+                let nibble = self.s.m.bin(c, Bin::And, in_row, seven);
+                let shift = self.s.m.bin(c, Bin::Shl, nibble, two);
+                let pick = self.s.m.bin(c, Bin::LShr, selectors, shift);
+                let pick = self.s.m.bin(c, Bin::And, pick, fifteen);
+                let row = self.s.m.bin(c, Bin::And, lane, row_mask);
+                let row = self.s.m.bin(c, Bin::Xor, row, sixteen);
+                let source = self.s.m.bin(c, Bin::Or, row, pick);
+                let value = self.read_lane(value, source);
+
+                // With FI clear, guest EXEC controls whether the source
+                // contributes. BOUND_CTRL selects zero or keeps the old dst.
+                if let Some(active) = guard.filter(|_| v.opsel & 1 == 0) {
+                    let src_active = self.s.m.cast(c, Cast::ZExt, active, self.s.t.i32);
+                    let src_active = self.read_lane(src_active, source);
+                    let zero = self.s.m.i32(0);
+                    let src_active = self.s.m.cmp(c, pred::NE, src_active, zero);
+                    if v.opsel & 2 != 0 {
+                        let value = self.s.m.select(c, src_active, value, zero);
+                        return int(self, value);
+                    }
+                    let write = self.s.m.bin(c, Bin::And, active, src_active);
+                    return self.write_i(inst, value, Some(write));
+                }
+                int(self, value)
+            }
             "v_readfirstlane_b32"
                 if inst
                     .writes
@@ -11473,6 +11513,25 @@ mod tests {
         ];
         let (layout, used) = texture_and_uav_tables();
         lower_wave(&words, layout, used, false).unwrap();
+    }
+
+    #[test]
+    fn permlanex16_lowers_in_wave32_and_wave64() {
+        let words = [
+            0xD778_0001,
+            0x0004_0100, // v_permlanex16_b32 v1, v0, s0, s1
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let layout = vec![RootParam {
+            sgprs: 2,
+            ..root(RootType::Constants, 0, 0)
+        }];
+        for wave64 in [false, true] {
+            let result = lower_wave(&words, layout.clone(), vec![], wave64).unwrap();
+            assert!(result.wave_ops);
+        }
     }
 
     #[test]
