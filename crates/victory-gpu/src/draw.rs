@@ -720,6 +720,7 @@ impl State {
                         && u.dword == 0
                         && let Some(Root::View(address)) =
                             self.roots_ref(compute).get(usize::from(u.slot))
+                        && *address != 0
                         && let Some(shadow) = crate::shadow::find(*address, 1)
                     {
                         let uav = t.used.iter().any(|r| {
@@ -737,6 +738,7 @@ impl State {
                         None if u.dword == victory_shader::emit::ROOT_VIEW_OFFSET => {
                             // Where the root address lies in the copy its view shows.
                             let offset = match self.roots_ref(compute).get(usize::from(u.slot)) {
+                                Some(&Root::View(0)) => Some(0),
                                 Some(&Root::View(address)) => crate::shadow::find(address, 1)
                                     .and_then(|s| u32::try_from(s.offset(address)).ok()),
                                 _ => None,
@@ -891,6 +893,24 @@ impl State {
             not_run("a root view the title did not set");
             return None;
         };
+        let (key, host) = match self.heaps[0] {
+            0 => (MEMORY_HEAP, crate::memory::heap()),
+            h => (
+                std::ptr::from_ref(crate::descriptor::heap(h as This)) as usize,
+                crate::descriptor::heap(h as This).host(),
+            ),
+        };
+        let Some(host) = host else {
+            not_run("a root view without a host view heap");
+            return None;
+        };
+        if address == 0 {
+            let index = host.null_root_view(uav);
+            if index.is_none() {
+                not_run("no null root buffer view in the host heap");
+            }
+            return index.map(|slot| (slot, 0));
+        }
         let Some(shadow) = crate::shadow::find(address, 1) else {
             not_run("a root view outside title buffers");
             return None;
@@ -906,17 +926,6 @@ impl State {
             let len = if shadow.marked() { shadow.left(address) } else { shadow.left(address).min(1 << 20) };
             shadow.gpu_writes(list, address, len, true);
         }
-        let (key, host) = match self.heaps[0] {
-            0 => (MEMORY_HEAP, crate::memory::heap()),
-            h => (
-                std::ptr::from_ref(crate::descriptor::heap(h as This)) as usize,
-                crate::descriptor::heap(h as This).host(),
-            ),
-        };
-        let Some(host) = host else {
-            not_run("a root view without a host view heap");
-            return None;
-        };
         let copy = std::sync::Arc::as_ptr(&shadow) as usize;
         if let Some(&index) = self.root_slots.get(&(key, copy, uav)) {
             return Some((index, offset));
@@ -2201,6 +2210,39 @@ uint ps() : SV_Target { return 1; }
             }
             host.execute(&[&list]);
             assert_eq!(out.read_host(dst_bytes as u64, 16), want, "round {round}");
+        }
+
+        // Rebind the same slots to a null SRV, then to a null UAV. The
+        // previous round left nonzero words in the destination.
+        for null_uav in [false, true] {
+            list.reset();
+            let mut state = State::default();
+            state.set_heaps(&[heap]);
+            assert!(state.root_view(&list, true, 0, false).is_none(), "unset root");
+            state.set_view(true, 0, if null_uav { src + 0x18_0100 } else { 0 });
+            state.set_view(true, 1, if null_uav { 0 } else { dst_bytes as u64 });
+            let (input, at) = state.root_view(&list, true, 0, false).unwrap();
+            let (output, out_at) = state.root_view(&list, true, 1, true).unwrap();
+            assert_ne!(input, output);
+            assert_eq!(state.root_slots.len(), 1, "only the real buffer needs a dynamic view");
+            assert_eq!(out_at, 0);
+            if !null_uav {
+                assert_eq!(at, 0);
+            }
+            let constants = [at, 0];
+            // SAFETY: all descriptors are in the bound heap and held through execution.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(input));
+                list.list.SetComputeRootDescriptorTable(1, heap_host.gpu(output));
+                list.list.SetComputeRoot32BitConstants(2, 2, constants.as_ptr().cast(), 0);
+                list.list.SetPipelineState(&pso);
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+            host.execute(&[&list]);
+            assert_eq!(out.read_host(dst_bytes as u64, 16), [0; 16]);
         }
     }
 
