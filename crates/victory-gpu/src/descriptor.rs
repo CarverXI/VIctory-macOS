@@ -302,9 +302,10 @@ pub(crate) fn read_textures(slots: &[u32]) -> std::collections::HashSet<usize> {
     textures
 }
 
-/// Every shader-visible view heap's slots viewing one of the host textures
-/// `textures` (raw pointers) are left null, made again when read
-/// (`crate::resource::evict` gives those textures up).
+/// Every shader-visible view heap's title slots viewing one of the host
+/// textures `textures` (raw pointers) are left null, made again when read
+/// (`crate::resource::evict` gives those textures up). Dynamic slots stay
+/// made for the lists that recorded them.
 #[cfg(windows)]
 pub(crate) fn evict(textures: &std::collections::HashSet<usize>) {
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
