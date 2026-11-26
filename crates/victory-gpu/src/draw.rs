@@ -1109,7 +1109,7 @@ impl State {
                                 words.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
                             let _ = write!(text, " (title words {w:x?}");
                             if let Some(view) = crate::descriptor::view(at) {
-                                let _ = write!(text, ": {}", describe(Some(&view)));
+                                let _ = write!(text, ": {}", describe(Some(&*view)));
                             }
                             let _ = write!(text, ")");
                         }
@@ -1291,11 +1291,12 @@ impl State {
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                let view = crate::descriptor::view(table + u64::from(k) * 32);
+                match view.as_deref() {
                     Some(view) => {
-                        host.make_at(index, &view);
+                        host.make_at(index, view);
                         if let Some(u) = used {
-                            readable(list, u, &view, true);
+                            readable(list, u, view, true);
                         }
                     }
                     None => {
@@ -1369,9 +1370,9 @@ impl State {
                 let Some(view) = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) else {
                     continue;
                 };
-                let range = match view {
-                    View::Constant(address, size) => Some((address, u64::from(size))),
-                    ref v => crate::descriptor::host::buffer_range(v),
+                let range = match &*view {
+                    View::Constant(address, size) => Some((*address, u64::from(*size))),
+                    v => crate::descriptor::host::buffer_range(v),
                 };
                 let Some((at, len)) = range.filter(|r| r.1 <= 64) else {
                     continue;
@@ -1401,10 +1402,14 @@ impl State {
                 let (RootType::Table, Some(Root::Table(table))) = (u.root, self.compute.get(usize::from(u.slot))) else {
                     continue;
                 };
-                let Some(View::Unordered(r, ..)) = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) else {
+                let Some(view) = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) else {
                     continue;
                 };
-                let Some(t) = crate::resource::host_resource(r as This) else { continue };
+                let View::Unordered(r, ..) = &*view else {
+                    continue;
+                };
+                let resource = *r;
+                let Some(t) = crate::resource::host_resource(resource as This) else { continue };
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
                 if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D && d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D {
@@ -1422,9 +1427,9 @@ impl State {
                 };
                 // SAFETY: an open list.
                 unsafe { list.list.ResourceBarrier(&[all]) };
-                crate::list::ensure_state(list, r as This, COPY_SOURCE);
+                crate::list::ensure_state(list, resource as This, COPY_SOURCE);
                 let read = crate::capture::read_back(&host.device, &list.list, &t);
-                crate::list::ensure_state(list, r as This, UNORDERED);
+                crate::list::ensure_state(list, resource as This, UNORDERED);
                 let Some((buffer, f)) = read else { continue };
                 list.keep(&buffer);
                 struct Readback(ID3D12Resource);
@@ -1433,7 +1438,7 @@ impl State {
                 // SAFETY: as above.
                 unsafe impl Sync for Readback {}
                 let buffer = Readback(buffer);
-                let who = format!("{} s{}+{} {r:#x} {}x{}x{} f{}", stage.shader.hash, u.slot, u.table_offset_dwords, d.Width, d.Height, d.DepthOrArraySize, d.Format.0);
+                let who = format!("{} s{}+{} {resource:#x} {}x{}x{} f{}", stage.shader.hash, u.slot, u.table_offset_dwords, d.Width, d.Height, d.DepthOrArraySize, d.Format.0);
                 list.defer_after(move || {
                     let mut data = std::ptr::null_mut();
                     // SAFETY: the list has run; the mapping spans the first slice.
@@ -1468,10 +1473,10 @@ impl State {
                     (RootType::Table, Some(Root::Table(table))) => {
                         let handle = table + u64::from(u.table_offset_dwords) * 4;
                         let view = crate::descriptor::view(handle);
-                        let mut text = describe(view.as_ref());
+                        let mut text = describe(view.as_deref());
                         // The title's view words, and whether the host slot
                         // the shader reads was made from a view.
-                        if let Some(View::Shader(_, Some(w)) | View::Unordered(_, _, Some(w))) = &view {
+                        if let Some(View::Shader(_, Some(w)) | View::Unordered(_, _, Some(w))) = view.as_deref() {
                             text.push_str(&format!(" words {w:?}"));
                         }
                         let slot = (self.heaps[0] != 0)
@@ -1480,7 +1485,7 @@ impl State {
                                 let i = handle.checked_sub(h.start)? / 32;
                                 h.host()?.describe_slot(u32::try_from(i).ok()?)
                             });
-                        let current: String = view.as_ref().map(|v| format!("{v:?}")).unwrap_or_default().chars().take(120).collect();
+                        let current: String = view.as_deref().map(|v| format!("{v:?}")).unwrap_or_default().chars().take(120).collect();
                         text.push_str(match slot.as_deref() {
                             Some("null") => " slot null",
                             Some(s) if s.starts_with(&current) => " slot made",

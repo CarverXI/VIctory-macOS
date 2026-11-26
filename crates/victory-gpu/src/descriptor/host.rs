@@ -12,7 +12,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::paged::Paged;
-use super::{VIEW_TAG, View, view_at, views_current};
+use super::{VIEW_TAG, View, ViewPin, view_at, views_current};
 use crate::host::host;
 
 pub(crate) struct HostHeap {
@@ -592,7 +592,7 @@ impl HostHeap {
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             for (i, &key) in made.iter().enumerate() {
                 let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
-                write_address(data, i, view.as_ref());
+                write_address(data, i, view.as_deref());
             }
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -701,10 +701,11 @@ impl HostHeap {
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
-    /// if it changed since, and returns the view recorded there. Buffer
-    /// views are made only for draws (`for_draw`), which also copy their
-    /// data: a host copy of a buffer is made on first use.
-    pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+    /// if it changed since, and returns the view recorded there, pinned for
+    /// as long as the caller uses it. Buffer views are made only for draws
+    /// (`for_draw`), which also copy their data: a host copy of a buffer is
+    /// made on first use.
+    pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<ViewPin> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -778,6 +779,7 @@ impl HostHeap {
             // SAFETY: as above.
             if unsafe { (handle as *const [u32; 3]).read_unaligned() } != [tag, i, generation] {
                 drop(made);
+                drop(view);
                 return self.mirror(index, handle, for_draw);
             }
             if made[index as usize] == key && !lazy() {
@@ -875,7 +877,7 @@ impl HostHeap {
             }
             self.keep(index, None);
             if index < self.count {
-                self.viewed.set(index, view.as_ref(), false);
+                self.viewed.set(index, view.as_deref(), false);
                 crate::shadow::forget_read(index);
             }
         }
@@ -897,7 +899,7 @@ impl HostHeap {
         let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
         let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten()?;
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some();
-        (is_placed_texture(&view) && !kept).then_some(view)
+        (is_placed_texture(&view) && !kept).then(|| (*view).clone())
     }
 
     /// A shader read slot `index` through the heap: the texture it views
@@ -907,9 +909,10 @@ impl HostHeap {
         let Some(view) = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten() else {
             return;
         };
-        let view = placed_texture(&view).unwrap_or(view);
-        if let View::Shader(r, _) = view
-            && let Some(t) = crate::resource::made_copy(r as crate::object::This)
+        let placed = placed_texture(&view);
+        let current = placed.as_ref().unwrap_or(&view);
+        if let View::Shader(resource, _) = current
+            && let Some(t) = crate::resource::made_copy(*resource as crate::object::This)
         {
             t.stamp();
         }
@@ -2096,6 +2099,60 @@ mod tests {
         if let Some(work) = work {
             work();
         }
+    }
+
+    /// A resource's final release during preparation returns at once, and the
+    /// resource stays alive for the make: the view's pin frees it when the
+    /// caller drops the view.
+    #[test]
+    fn a_resource_released_while_its_view_is_prepared_outlives_the_make() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let resource = crate::resource::test_buffer(256);
+        let mut record = [0u32; 12];
+        let at = record.as_mut_ptr() as u64;
+        // R8_UINT buffer SRV, all 256 elements.
+        let desc = [62, 1, 0x1688, 0, 0, 256, 0, 0, 0, 0];
+        crate::descriptor::create_srv(std::ptr::null(), resource, &desc, at);
+        let Some(heap) = HostHeap::new(false, 1) else {
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(resource, 0x10)(
+                resource,
+            );
+            return;
+        };
+
+        let address = resource as usize;
+        let release = crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(
+            resource,
+            0x10,
+        );
+        *WHILE_PREPARING.lock().unwrap() = Some(Box::new(move || {
+            // The title's last reference goes while the view is being made.
+            // The call must not wait for the make: this very thread is the
+            // one making the view, so a wait would never end.
+            let released = std::thread::spawn(move || release(address as crate::object::This));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !released.is_finished() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the title's release waited for the view's make"
+                );
+                std::thread::yield_now();
+            }
+            assert_eq!(released.join().unwrap(), 1, "the pin still holds it");
+        }));
+
+        let view = heap.mirror(0, at, false).expect("the current view");
+        assert!(WHILE_PREPARING.lock().unwrap().is_none(), "the prepare ran");
+        assert!(heap.made(0), "the view was made from the live resource");
+        assert!(
+            crate::descriptor::view(at).is_some(),
+            "still current while the caller holds the view"
+        );
+        // The last pin's drop frees the resource and makes its views stale.
+        drop(view);
+        assert!(crate::descriptor::view(at).is_none(), "stale once it is freed");
     }
 
     /// A record the title writes into a slot while another thread prepares

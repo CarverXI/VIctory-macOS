@@ -590,12 +590,77 @@ pub(crate) fn forget(resource: usize) {
     }
 }
 
-/// The view of entry `i` if `generation` is still its own.
-#[cfg(windows)]
-fn view_at(i: u32, generation: u32) -> Option<View> {
+/// A current view whose resources cannot be freed while it is used: it holds
+/// a reference on each resource object the view names (and none is made for
+/// a resource the title's last release had already reached). The title's
+/// release never waits for it. A release that would have been the last runs
+/// at the pin's drop instead, on whichever thread drops it, so a pin is
+/// dropped outside the locks the destructor takes (`VIEWS`, `bindless`,
+/// `shadow`).
+#[cfg(any(windows, test))]
+pub(crate) struct ViewPin {
+    view: View,
+    held: [usize; 2],
+}
+
+#[cfg(any(windows, test))]
+impl std::ops::Deref for ViewPin {
+    type Target = View;
+
+    fn deref(&self) -> &Self::Target {
+        &self.view
+    }
+}
+
+#[cfg(any(windows, test))]
+impl std::fmt::Debug for ViewPin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.view.fmt(f)
+    }
+}
+
+#[cfg(any(windows, test))]
+impl Drop for ViewPin {
+    fn drop(&mut self) {
+        for r in self.held.into_iter().filter(|&r| r != 0) {
+            crate::object::release_ref(r as This);
+        }
+    }
+}
+
+/// The view of entry `i` if `generation` is still its own, pinned until the
+/// returned value is dropped.
+///
+/// The references are taken under the shared lock. `Resource::drop` takes
+/// the exclusive one (`forget`) before its memory goes, so the address of a
+/// current entry's resource is still there to count on. A resource whose
+/// count already reached zero is on its way out, and the view is not current
+/// for it.
+#[cfg(any(windows, test))]
+fn view_at(i: u32, generation: u32) -> Option<ViewPin> {
     let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
-    (*current == generation).then(|| view.clone())
+    if *current != generation {
+        return None;
+    }
+    let view = view.clone();
+    let mut held = [0usize; 2];
+    let mut all = true;
+    for (slot, r) in view.resources().into_iter().enumerate() {
+        if r == 0 {
+            continue;
+        }
+        if crate::object::try_add_ref(r as This) {
+            held[slot] = r;
+        } else {
+            all = false;
+        }
+    }
+    drop(views);
+    // Dropped here, with the lock released, if a resource was already gone:
+    // the references taken on the others may be their last.
+    let pin = ViewPin { view, held };
+    all.then_some(pin)
 }
 
 /// For each record (tag, index, generation): whether it names a view that
@@ -610,16 +675,16 @@ fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
         .collect()
 }
 
-/// The view recorded at `handle`, if one is (and its resource is alive).
-pub(crate) fn view(handle: u64) -> Option<View> {
+/// The view recorded at `handle`, if one is (and its resource is alive),
+/// pinned until the returned value is dropped.
+#[cfg(any(windows, test))]
+pub(crate) fn view(handle: u64) -> Option<ViewPin> {
     if handle == 0 {
         return None;
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (tag == VIEW_TAG && *current == generation).then(|| view.clone())
+    (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten()
 }
 
 /// A description of `N` words, if the title passes one.
@@ -987,9 +1052,9 @@ pub(crate) mod tests {
         let at = |i: usize| heap.as_ptr() as u64 + 32 * i as u64;
         let (s0, s1, s2, s3) = (at(0), at(1), at(2), at(3));
         create_cbv(null, &[0x1000, 1, 256, 0], s0);
-        assert_eq!(view(s0), Some(View::Constant(0x1_0000_1000, 256)));
+        assert_eq!(view(s0).as_deref(), Some(&View::Constant(0x1_0000_1000, 256)));
         create_srv(null, null, std::ptr::null(), s1);
-        assert_eq!(view(s1), Some(View::Shader(0, None)));
+        assert_eq!(view(s1).as_deref(), Some(&View::Shader(0, None)));
         // The same view twice is one entry.
         create_srv(null, null, std::ptr::null(), s2);
         // SAFETY: both slots are in `heap`.
@@ -1008,29 +1073,80 @@ pub(crate) mod tests {
             src_n.as_ptr(),
             0,
         );
-        assert_eq!(view(s2), view(s0));
-        assert_eq!(view(s3), view(s1));
-        assert_eq!(view(at(0) + 8), None);
+        assert_eq!(view(s2).as_deref(), view(s0).as_deref());
+        assert_eq!(view(s3).as_deref(), view(s1).as_deref());
+        assert!(view(at(0) + 8).is_none());
         heap[0] = 0;
     }
 
+    /// An object of ours that frees itself at its last release, as a
+    /// resource does: its views go stale first (`forget`), and `FREED` notes
+    /// its address.
+    static FREED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+    fn freed(address: usize) -> bool {
+        FREED.lock().unwrap().contains(&address)
+    }
+
+    extern "system" fn release_resource_like(this: This) -> u32 {
+        if crate::object::refs(this) == 1 {
+            forget(this as usize);
+            FREED.lock().unwrap().push(this as usize);
+        }
+        crate::object::release_boxed::<crate::object::Object>(this)
+    }
+
     /// A released resource's views go stale; the same view of a new
-    /// resource at the same address is a new record.
+    /// resource is a new record.
     #[test]
     fn views_die_with_their_resource() {
         let null = std::ptr::null();
         let slots = [0u64; 2 * 4];
         let (a, b) = (slots.as_ptr() as u64, slots.as_ptr() as u64 + 32);
-        let resource = 0x7777_0000usize as This;
+        let resource = crate::object::test_object(release_resource_like);
+        let address = resource as usize;
         create_srv(null, resource, std::ptr::null(), a);
-        assert_eq!(view(a), Some(View::Shader(0x7777_0000, None)));
-        forget(0x7777_0000);
-        assert_eq!(view(a), None, "stale after release");
-        create_srv(null, resource, std::ptr::null(), b);
-        assert_eq!(view(b), Some(View::Shader(0x7777_0000, None)));
+        assert_eq!(view(a).as_deref(), Some(&View::Shader(address, None)));
+        // The last release frees the object, and its views go stale.
+        assert_eq!(crate::object::release_ref(resource), 0);
+        assert!(view(a).is_none(), "stale after release");
+        let again = crate::object::test_object(release_resource_like);
+        create_srv(null, again, std::ptr::null(), b);
+        assert_eq!(
+            view(b).as_deref(),
+            Some(&View::Shader(again as usize, None))
+        );
         // SAFETY: both slots are in `slots`.
         let (old, new) = unsafe { (*(a as *const [u32; 3]), *(b as *const [u32; 3])) };
-        assert_ne!(old, new, "a new generation");
+        assert_ne!(old[1..], new[1..], "a new entry or generation");
+        assert_eq!(crate::object::release_ref(again), 0);
+    }
+
+    /// A final release with the view pinned does not wait: the title's call
+    /// returns at once, the resource is kept alive, and the last pin's drop
+    /// does the freeing (which makes the views stale then).
+    #[test]
+    fn a_pinned_resource_is_freed_by_the_last_pin() {
+        let null = std::ptr::null();
+        let slots = [0u64; 2 * 4];
+        let at = slots.as_ptr() as u64;
+        let resource = crate::object::test_object(release_resource_like);
+        let address = resource as usize;
+        FREED.lock().unwrap().retain(|&a| a != address);
+        create_srv(null, resource, std::ptr::null(), at);
+        let first = view(at).expect("a current view");
+        let second = view(at).expect("the same current view again");
+
+        // The title releases its last reference with both pins held; the
+        // call returns while the object is held by them.
+        assert_eq!(crate::object::release_ref(resource), 2);
+        assert!(!freed(address));
+        assert!(view(at).is_some(), "the entry stays current while pinned");
+        drop(first);
+        assert!(!freed(address));
+        drop(second);
+        assert!(freed(address), "the last pin freed it");
+        assert!(view(at).is_none(), "stale after the last pin");
     }
 
     /// A record the title copies into its shader-visible heap as bytes (no
