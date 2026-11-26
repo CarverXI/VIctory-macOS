@@ -77,6 +77,9 @@ mod texture;
 mod twin;
 #[cfg(windows)]
 mod watch;
+// Whether the host opens heaps over process memory (ignored by default).
+#[cfg(all(windows, test))]
+mod inplace_probe;
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use copystat::CountingAlloc;
