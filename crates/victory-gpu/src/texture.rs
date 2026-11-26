@@ -435,7 +435,7 @@ pub(crate) fn record_upload(
         // SAFETY: an open list; the barrier names a live texture.
         unsafe { list.list.ResourceBarrier(&[b]) };
     }
-    copies(list, &copy.texture, staging, (buffer, *at), subresources, String::new);
+    copies(list, &copy.texture, staging, (buffer, *at), subresources);
     list.keep(buffer);
     staging.uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     staging.copied.fetch_add(subresources.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -460,16 +460,13 @@ pub(crate) fn copied(resource: This) -> u64 {
 
 
 /// Records the copy of `subresources` of `buffer` (laid out as `staging`
-/// says) into `texture` (in the copy destination state); `name` names it
-/// in diagnostics notes.
-#[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+/// says) into `texture` (in the copy destination state).
 fn copies(
     list: &HostList,
     texture: &ID3D12Resource,
     staging: &Staging,
     (buffer, at): (&ID3D12Resource, u64),
     subresources: &[u32],
-    name: impl Fn() -> String,
 ) {
     for &i in subresources {
         let i = i as usize;
@@ -485,8 +482,7 @@ fn copies(
             list.note_read(
                 || {
                     format!(
-                        "texture upload {} ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
-                        name(),
+                        "texture upload ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
                         d.Width,
                         d.Height,
                         d.DepthOrArraySize,
