@@ -4010,6 +4010,11 @@ impl Host {
     ) -> Result<Presenter, (&'static str, windows::core::Error)> {
         let hwnd = match shown.or_else(title_window) {
             Some(hwnd) => hwnd,
+            None if std::env::var_os("VICTORY_WINDOW_SECONDARY").as_deref()
+                == Some(std::ffi::OsStr::new("1")) =>
+            {
+                return Err(("secondary title window unavailable", windows::core::Error::empty()));
+            }
             None => window(width, height).map_err(|e| ("window", e))?,
         };
         self.presenter_for_window(queue, hwnd, width, height, format)
