@@ -40,6 +40,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::s;
 
 use crate::ambient_set as set;
+use crate::backend::HostGpu;
 use crate::host::{Host, HostList, host};
 use crate::object::This;
 use crate::resource::HostTexture;
