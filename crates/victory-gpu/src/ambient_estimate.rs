@@ -271,7 +271,7 @@ fn stage(pass: &str, name: PCSTR) -> windows::core::Result<Stage> {
         Param::Uav { register: 3 },
         Param::Uav { register: 4 },
     ];
-    let (root, pso) = crate::compute::pipeline(&set::part(pass), name, 0, &params).inspect_err(|e| eprintln!("DBG stage {pass}: {e:?}"))?;
+    let (root, pso) = crate::compute::pipeline(&set::part(pass), name, 0, &params)?;
     Ok(Stage { root, pso })
 }
 
