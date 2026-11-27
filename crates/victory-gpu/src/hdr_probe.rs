@@ -737,6 +737,8 @@ fn probe_texture_with_clock(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use crate::backend::HostGpu;
 
     fn approx(a: f32, b: f32, eps: f32) {
         assert!((a - b).abs() <= eps, "expected {a} ~= {b} (eps {eps})");
