@@ -184,6 +184,7 @@ pub(crate) fn sky_drawn(image: usize) {
 /// estimate (`crate::ambient_estimate`): its level and colour, the gain,
 /// least level and power with which it follows the sky (if it does), and
 /// the sky image the title last drew (if any).
+#[allow(clippy::type_complexity)]
 pub(crate) fn light_now() -> (f32, [f32; 3], Option<[f32; 3]>, Option<std::sync::Arc<HostTexture>>) {
     let sky = SKY_IMAGE.lock().unwrap_or_else(|e| e.into_inner()).clone();
     (live_level().unwrap_or_else(level), tint(), follow(), sky)

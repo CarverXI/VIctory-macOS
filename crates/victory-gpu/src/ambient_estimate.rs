@@ -1464,15 +1464,18 @@ mod tests {
             let keeping = time(&|list| pass.keep(host, list, radiance, HALF, None, &BASE));
             // SAFETY (the three below): an open list; live textures in the
             // states the passes need.
+            // SAFETY: as above.
             let placing = time(&|list| unsafe {
                 let table = pass.table(host, &list.list, None, Some(depth), None);
                 pass.run(list, "place", &pass.place, &constants(&BASE), table, [set::CX / 8, set::CY / 4, 1]);
             });
+            // SAFETY: as above.
             let gathering = time(&|list| unsafe {
                 let table = pass.table(host, &list.list, None, Some(depth), None);
                 pass.run(list, "gather", &pass.gather, &constants(&BASE), table, [set::PX / 8, set::PY / 2, 1]);
             });
             let raise = |given: set::Pass| {
+                // SAFETY: as above.
                 time(&|list| unsafe {
                     let table = pass.table(host, &list.list, Some(light), Some(depth), None);
                     pass.run(list, "raise", &pass.raise, &constants(&given), table, [SIZE[0] / 8, SIZE[1] / 8, 1]);
