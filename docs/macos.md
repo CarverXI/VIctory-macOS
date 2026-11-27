@@ -281,6 +281,7 @@ None of these changes the default, except `VICTORY_OUTPUT`, which sets the title
 | `VICTORY_STEP_OVER=pool` | Steps over the title's "no free element" traps: an `int3` followed by `xor r, r`, the shape of a full fixed-size pool's allocator, whose caller then gets the NULL it already checks for. Series 1.0.2.1 hits one at `+0x5149aec` (the instance lists' pool, Marvisak/VIctory#698) about 20 minutes into the opening when frames take seconds. A list of hex offsets also works. |
 | `VICTORY_WINDOW_SECONDARY=1` | Opens the game window on the only non-primary display. |
 | `VICTORY_WINDOW_SECONDARY=x,y` | Opens the game window on the display that holds the desktop point `x,y`, for layouts with more than one extra display (a Sidecar iPad beside two monitors, say). |
+
 ## An ambient light in place of ray-traced indirect light
 
 `VICTORY_AMBIENT=1` turns on a stand-in from Belobug's fork (`victory-gpu/src/ambient.rs`). It is off by default, and off it changes nothing. The game lights what the sun does not reach with probes it fills by tracing rays. Right after the game's program that resolves those probes (`CS_ScreenProbes_TemporalResolve_*`), a compute pass of VIctory's own replaces that program's output with an ambient light: the same everywhere in a frame, darker in creases and under objects (worked out from the depth image). By default its level and colour follow the sky dome the game draws for its reflections. After the game's last reflection pass (`CS_UpdateHistory`), a second pass of the same shader holds reflections to half of that light.
