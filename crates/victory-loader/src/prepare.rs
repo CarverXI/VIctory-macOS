@@ -336,16 +336,12 @@ mod tests {
     #[test]
     fn a_tls_directory_past_the_4_gib_limit_is_an_error_not_a_panic() {
         // directory_rva + TLS64_ADDRESS_OF_CALLBACKS overflows u32: a panic
-        // in debug builds, a wrapped RVA in release ones, before.
+        // in debug builds, a wrapped RVA in release ones, before. The parse
+        // now refuses a directory outside the image, so `prepare` never
+        // gets to the addition.
         let image = synthetic_tls_image(0xFFFF_FFF0);
-        let info = ImageInfo::parse(&image).unwrap();
-        assert_ne!(info.tls.as_ref().unwrap().callbacks_va, 0);
-        assert!(matches!(
-            prepare(&image),
-            Err(PrepareError::Patch("TLS callback field RVA overflow"))
-        ));
-        // The same image with the directory where the field RVA fits works.
-        assert!(prepare(&synthetic_tls_image(0xFFFF_F100)).is_ok());
+        assert!(ImageInfo::parse(&image).is_err());
+        assert!(prepare(&image).is_err());
     }
 
     #[test]
