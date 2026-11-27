@@ -20,6 +20,8 @@
 mod alias;
 pub mod bench;
 #[cfg(windows)]
+mod backend;
+#[cfg(windows)]
 mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;

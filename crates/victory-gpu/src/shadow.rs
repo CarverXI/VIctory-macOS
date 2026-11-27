@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
+use crate::backend::HostMemory;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
@@ -2336,6 +2337,7 @@ mod snapshot_bench;
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::backend::HostGpu;
 
     /// A shader's read mark of heap slot `slot` in the bitmap of shaders
     /// that use title memory (`memory`) or of the others.

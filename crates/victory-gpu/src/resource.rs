@@ -2610,6 +2610,8 @@ pub(crate) fn test_texture_2d(width: u32, height: u32, format: u32, flags: u32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use crate::backend::HostGpu;
 
     #[cfg(windows)]
     #[test]
