@@ -78,6 +78,7 @@
 //!   stand-in holds them to a part of its level ([`hold`],
 //!   `VICTORY_AMBIENT_REFLECT`); the fork leaves them alone (`0` here).
 
+use crate::backend::{HostGpu, HostMemory};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use windows::Win32::Graphics::Direct3D12::*;
