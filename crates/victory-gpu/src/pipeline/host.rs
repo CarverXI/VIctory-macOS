@@ -442,9 +442,10 @@ impl HostPipeline {
         for (s, _) in &stages {
             s.translated()?;
         }
-        // Mesh shaders whose standalone output footprint exceeds Metal's 32 KiB
-        // limit are re-translated together with their paired pixel shader,
-        // pruning outputs the pixel shader never reads.
+        // Mesh shaders whose standalone output footprint (packed or Metal-
+        // aligned) exceeds Metal's 32 KiB limit are re-translated together with
+        // their paired pixel shader, pruning unread outputs and repacking
+        // attribute order to eliminate alignment padding holes.
         let linked = mesh.filter(|_| super::link_mesh_outputs()).and_then(|ms| {
             over_limit_mesh_output_bytes(&ms.translated()?.host.dxil)?;
             super::translate_linked(ms, find("pixel").map(Arc::as_ref))
