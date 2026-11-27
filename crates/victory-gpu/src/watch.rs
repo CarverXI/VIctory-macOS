@@ -1110,6 +1110,7 @@ pub fn writing(at: usize, len: usize) -> Writing {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::texback::remapped(at, len);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     remapped(&mut guards(), first, last);
     crate::shadow::forget_range(at, len);
