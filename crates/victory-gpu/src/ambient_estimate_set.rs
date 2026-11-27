@@ -490,7 +490,7 @@ void main(uint3 at : SV_DispatchThreadID) {
             float shut = 0.0;
             const int N = 12;
             for (int i = 0; i < N; i++) {
-                float a = i * 2.399963 + noise * std::f32::consts::TAU;
+                float a = i * 2.399963 + noise * 6.2831853;
                 float2 o = float2(cos(a), sin(a)) * (sqrt((i + 0.5) / N) * px);
                 float3 v = seen(p + (int2)round(o), size) - c;
                 float vv = dot(v, v);
