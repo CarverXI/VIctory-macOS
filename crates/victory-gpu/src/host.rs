@@ -3992,6 +3992,15 @@ impl HostList {
                     } else {
                         copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     }
+                    if crate::shadow::shadow_keep_enabled() {
+                        crate::shadow::forget_range(dst, len);
+                        for page in crate::watch::alias_pages(dst, len) {
+                            crate::shadow::forget_range(
+                                page * crate::watch::PAGE,
+                                crate::watch::PAGE,
+                            );
+                        }
+                    }
                     len
                 }
                 &Step::Fill(dst, src, len) => {
